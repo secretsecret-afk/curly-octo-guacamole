@@ -21,7 +21,7 @@ async def send_welcome(message: Message):
     )
 
 async def main():
-    dp.startup.register(lambda _: print("Бот запущен!"))
+    dp.startup.register(lambda _: print("Бот запущен!!"))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
