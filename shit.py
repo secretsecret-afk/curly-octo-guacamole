@@ -3,8 +3,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
-load_dotenv()
+# Загружаем переменные окружения из .env.prem
+load_dotenv(dotenv_path=".env.prem")
 API_TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=API_TOKEN)
