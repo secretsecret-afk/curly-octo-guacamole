@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 # Загружаем переменные окружения из .env.prem
 load_dotenv(dotenv_path=".env.prem")
-API_TOKEN = os.getenv("BOT_TOKEN")
+API_TOKEN = os.getenv("BOT_TOKEN2")
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
