@@ -34,7 +34,7 @@ async def send_welcome(message: Message):
     caption = (
         "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
         "Здесь вы можете приобрести Premium-версию Gene Brawl!\n\n"
-        "Все товары из списка ниже выдаются навсегда.\n"
+        "Gene Premium Ultimate выдается навсегда.\n"
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(
