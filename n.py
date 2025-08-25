@@ -40,7 +40,7 @@ async def send_welcome(message: Message):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🫣 Premium - 500stars", callback_data="premium")],
-            [InlineKeyboardButton(text="🛠 Поддержка", url="https://t.me/YourSupportLink")],
+            [InlineKeyboardButton(text="🛠 Поддержка", url="https://t.me/genepremiumsupportbot")],
         ]
     )
 
