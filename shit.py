@@ -16,7 +16,7 @@ async def start_handler(message: Message):
         await message.answer(f"Привет, {message.from_user.first_name}!\nЯзык интерфейса: {lang}")
 
 async def on_startup():
-    print("Бот запущен!")
+    print("Бот запущен!!")
 
 async def main():
     dp.startup.register(on_startup)
