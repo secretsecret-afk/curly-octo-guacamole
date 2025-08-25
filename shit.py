@@ -1,7 +1,6 @@
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
-import asyncio
-import os
+import asyncio, os
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=".env.prem")
@@ -16,7 +15,7 @@ async def start_handler(message: Message):
         lang = message.from_user.language_code
         await message.answer(f"Привет, {message.from_user.first_name}!\nЯзык интерфейса: {lang}")
 
-async def on_startup(startup):
+async def on_startup():
     print("Бот запущен!")
 
 async def main():
