@@ -185,6 +185,8 @@ class AlbumMiddleware(BaseMiddleware):
             messages = self._buffer.pop(group_id, [])
             # сортировка по ID (чтобы сохранить порядок)
             messages.sort(key=lambda m: m.message_id)
+            if not messages:
+                return
             data["album"] = messages
             # в handler полетит первый элемент альбома + весь альбом в data
             return await handler(messages[0], data)
@@ -217,7 +219,6 @@ async def send_welcome(message: Message):
 
     if os.path.exists(WELCOME_IMAGE):
         try:
-            # ИСПРАВЛЕНО: Используем FSInputFile для локального файла
             photo = FSInputFile(WELCOME_IMAGE)
             await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
         except Exception as e:
@@ -271,7 +272,7 @@ async def ask_screenshots(callback: CallbackQuery):
     langs = update_user_lang(str(user.id), user.language_code or "unknown")
 
     if not can_start_new_request(str(user.id)):
-        await callback.message.answer(""Вы уже подавали заявку, ожидайте одобрения ✅")
+        await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
 
     start_request(user, langs)
@@ -328,7 +329,7 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
     langs = update_user_lang(user_id, user.language_code or "unknown")
 
     if not has_active_request(user_id):
-        await message.answer("Чтобы подать заявку, сначала выберите способ оплаты в /start и следуйте инструкции.")
+        # [ИЗМЕНЕНО] Сообщение пользователю было удалено по вашей просьбе.
         return
 
     header = make_header(user, langs)
@@ -339,26 +340,45 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
     )
 
     try:
-        # ===== Альбом (список сообщений) =====
+        # ===== [ИСПРАВЛЕНО] Альбом (список сообщений) =====
         if album:
-            # собираем подпись: шапка + оригинальная подпись (если была на первом элементе)
             original_caption = album[0].caption or ""
-            caption = f"{header}\n\n{original_caption}".strip()
+            full_caption = f"{header}\n\n{original_caption}".strip()
+            
+            # Разделяем медиа на фото/видео и документы, так как их нельзя смешивать
+            photo_video_builder = MediaGroupBuilder()
+            doc_builder = MediaGroupBuilder()
 
-            builder = MediaGroupBuilder(caption=caption)
             for m in album:
                 if m.photo:
-                    builder.add_photo(m.photo[-1].file_id)
-                elif m.document:
-                    builder.add_document(m.document.file_id)
+                    photo_video_builder.add_photo(m.photo[-1].file_id)
                 elif m.video:
-                    # если вдруг видео — тоже добавим
-                    builder.add_video(m.video.file_id)
+                    photo_video_builder.add_video(m.video.file_id)
+                elif m.document:
+                    doc_builder.add_document(m.document.file_id)
+            
+            caption_sent = False
 
-            await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=builder.build())
-            await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
-            await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-            mark_submitted(user_id)
+            # Отправляем группу фото и видео, если они есть
+            if photo_video_builder.media:
+                # Устанавливаем общую подпись для этой группы
+                photo_video_builder.caption = full_caption
+                await bot.send_media_group(ADMIN_CHAT_ID, media=photo_video_builder.build())
+                caption_sent = True
+
+            # Отправляем группу документов, если они есть
+            if doc_builder.media:
+                # Если подпись еще не была отправлена с фото, добавляем ее к документам
+                if not caption_sent:
+                    doc_builder.caption = full_caption
+                await bot.send_media_group(ADMIN_CHAT_ID, media=doc_builder.build())
+
+            # Если были отправлены какие-либо медиа, добавляем кнопки управления
+            if photo_video_builder.media or doc_builder.media:
+                await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
+                await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
+                mark_submitted(user_id)
+            
             return
 
         # ===== Одиночное сообщение =====
