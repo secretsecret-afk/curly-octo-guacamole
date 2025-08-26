@@ -5,6 +5,7 @@ import random
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from html import escape
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -30,7 +31,8 @@ ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
 if ADMIN_CHAT_ID == 0:
-    print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.\nПроверь .env.prem")
+    print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.
+Проверь .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -182,9 +184,14 @@ async def send_welcome(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
     price = load_config()["price"]
     caption = (
-        "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
-        "Здесь вы можете приобрести Premium-версию Gene Brawl!\n\n"
-        "Gene Premium Ultimate выдается навсегда.\n"
+        "Добро пожаловать! Я платёжный бот Gene's Land!
+
+"
+        "Здесь вы можете приобрести Premium-версию Gene Brawl!
+
+"
+        "Gene Premium Ultimate выдается навсегда.
+"
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -219,14 +226,69 @@ async def process_premium(callback: CallbackQuery):
     await callback.answer()
     if callback.message.chat.type != "private":
         return
-    price = load_config()["price"]
+    # Build payment keyboard with emojis and Home button
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Описание", url="https://t.me/GenePremium/6")],
-        [InlineKeyboardButton(text=" Картой", callback_data="pay_card")],
-        [InlineKeyboardButton(text=" Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="💳 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🪙 Crypto (@send) (0%)", callback_data="pay_crypto")],
         [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
+        [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
     ])
-    await callback.message.answer(f"Вы выбрали Premium за {price}\n\nВыберите способ оплаты:", reply_markup=keyboard)
+
+    # Instead of sending a new separate message with price, edit the original message/caption
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption("Вы выбрали Premium", reply_markup=keyboard)
+        else:
+            await callback.message.edit_text("Вы выбрали Premium", reply_markup=keyboard)
+    except Exception:
+        # fallback — just send a new message if edit fails
+        await callback.message.answer("Вы выбрали Premium", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "home")
+async def go_home(callback: CallbackQuery):
+    await callback.answer()
+    if callback.message.chat.type != "private":
+        return
+    # Recreate the welcome screen (try to edit caption if there is photo)
+    price = load_config()["price"]
+    caption = (
+        "Добро пожаловать! Я платёжный бот Gene's Land!
+
+"
+        "Здесь вы можете приобрести Premium-версию Gene Brawl!
+
+"
+        "Gene Premium Ultimate выдается навсегда.
+"
+        "(Нажмите на товар, чтобы узнать подробности)"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f" Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text=" Поддержка", url="https://t.me/genepremiumsupportbot")],
+    ])
+    try:
+        if os.path.exists(WELCOME_IMAGE) and callback.message.photo:
+            # If the message already has a photo, just edit caption back
+            await callback.message.edit_caption(caption, reply_markup=keyboard)
+        else:
+            # Try to edit text; if impossible, send a new welcome message and delete old
+            try:
+                await callback.message.edit_text(caption, reply_markup=keyboard)
+            except Exception:
+                # delete old and send a fresh welcome (keeps UI clean)
+                try:
+                    await callback.message.delete()
+                except Exception:
+                    pass
+                if os.path.exists(WELCOME_IMAGE):
+                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=keyboard)
+                else:
+                    await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=keyboard)
+    except Exception as e:
+        print(f"[WARN] Не удалось вернуть домой: {e}")
+        # fallback
+        await callback.message.answer(caption, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
@@ -241,12 +303,21 @@ async def ask_screenshots(callback: CallbackQuery):
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
     start_request(user, langs)
     instruction = (
-        "Наша система сочла ваш аккаунт подозрительным.\n"
-        "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
-        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
-        "• Brawl Stars Datamines | Чат\n"
-        "• Gene's Land чат\n\n"
-        "А также (по желанию) фото прошитого 4G модема.\n\n"
+        "Наша система сочла ваш аккаунт подозрительным.
+"
+        "Для покупки Gene Premium мы обязаны убедиться в вас.
+
+"
+        "📸 Отправьте скриншоты ваших первых сообщений в:
+"
+        "• Brawl Stars Datamines | Чат
+"
+        "• Gene's Land чат
+
+"
+        "А также (по желанию) фото прошитого 4G модема.
+
+"
         "⏳ Срок одобрения заявки ~3 дня."
     )
 
@@ -279,7 +350,8 @@ async def reject_request(callback: CallbackQuery):
         del data[user_id]
         save_requests(data)
     try:
-        await bot.send_message(user_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
+        await bot.send_message(user_id, "❌ Ваша заявка отклонена.
+Вы можете попробовать подать её снова.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
     try:
@@ -312,10 +384,13 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         update_user_lang(user_id_str, user.language_code or "unknown")
 
         # Шапка для админов + клавиатура
-        header = (
-            f"【0†{user.full_name}】 "
-            f"(id `{user.id}` | Языки: {user.language_code or 'неизвестно'})"
-        )
+        # Экранируем данные, убираем лишние символы, показываем аккуратно
+        safe_full_name = escape(user.full_name or "(без имени)")
+        safe_username = f"@{escape(user.username)}" if user.username else ""
+        safe_lang = escape(user.language_code or "неизвестно")
+        header = f"{safe_full_name} {safe_username}
+ID: {user.id}
+Язык: {safe_lang}"
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]
@@ -331,11 +406,10 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                 # Если это настоящий альбом — все сообщения имеют одинаковый media_group_id
                 media_group_ids = {getattr(m, 'media_group_id', None) for m in album_msgs}
                 if len(media_group_ids) == 1 and next(iter(media_group_ids)) is not None:
-                    # Для альбомов: сначала отправляем первое сообщение (с подписью),
-                    # затем остальные медиa по одному сообщению
-                    for i, m in enumerate(album_msgs):
+                    # Для альбомов: сначала копируем все медиa (telegram сохранит порядок),
+                    # затем отправляем шапку с кнопкой
+                    for m in album_msgs:
                         await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
-                    # после медиа — отправляем шапку с кнопкой
                     await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
 
                 else:
@@ -370,7 +444,8 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
 
             # уведомляем пользователя и помечаем заявку
-            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.\nОжидайте ответа.")
+            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.
+Ожидайте ответа.")
             mark_submitted(user_id_str)
 
         except TelegramBadRequest as e:
@@ -379,7 +454,8 @@ async def handle_submission(messages: Union[Message, List[Message]]):
             await first_message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз (или без подписи).")
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-            await first_message.answer("⚠️ Не удалось отправить администраторам.\nПопробуйте ещё раз позже.")
+            await first_message.answer("⚠️ Не удалось отправить администраторам.
+Попробуйте ещё раз позже.")
 
 
 # Новый обработчик: собирает сообщения от пользователя в буфер и запускает задачу-коллектор
