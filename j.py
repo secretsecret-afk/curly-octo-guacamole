@@ -11,13 +11,12 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaDocument,
     FSInputFile
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
-from aiogram.utils.media_group import MediaGroupBuilder
 
 # ===================== ENV =====================
+
 load_dotenv(".env.prem")
 API_TOKEN = os.getenv("BOT_TOKEN2")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
@@ -40,6 +39,7 @@ CONFIG_FILE = "config.json"
 WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
 
 # ===================== STORAGE =====================
+
 def _now() -> datetime:
     return datetime.now()
 
@@ -123,12 +123,14 @@ def has_active_request(user_id: str) -> bool:
         return False
 
 # ===================== CONFIG (цена) =====================
+
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError): pass
+        except (json.JSONDecodeError, IOError):
+            pass
     return {"price": "9$"}
 
 def save_config(config: dict) -> None:
@@ -136,6 +138,7 @@ def save_config(config: dict) -> None:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 # ===================== HELPERS =====================
+
 async def ensure_private_and_autoleave(message: Message) -> bool:
     if message.chat.type != "private":
         if message.chat.id != ADMIN_CHAT_ID:
@@ -153,8 +156,9 @@ def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
     return f"{user.full_name} | id {user.id} | {username} | Языки: {langs_str}"
 
 # ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
+
 class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, wait: float = 1.0): # Таймер в 1 секунду
+    def __init__(self, wait: float = 1.0):
         super().__init__()
         self.wait = wait
         self._buffer: Dict[str, List[Message]] = defaultdict(list)
@@ -174,7 +178,8 @@ class AlbumMiddleware(BaseMiddleware):
             self._buffer[group_id].append(event)
             await asyncio.sleep(self.wait)
             messages = self._buffer.pop(group_id, [])
-            if not messages: return
+            if not messages:
+                return
 
             messages.sort(key=lambda m: m.message_id)
             data["album"] = messages
@@ -183,6 +188,7 @@ class AlbumMiddleware(BaseMiddleware):
 dp.message.middleware(AlbumMiddleware(wait=1.0))
 
 # ===================== HANDLERS =====================
+
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
     if not await ensure_private_and_autoleave(message): return
@@ -281,65 +287,65 @@ async def reject_request(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
 
-# ===================== ПРИЁМ ЗАЯВОК (С ПОДДЕРЖКОЙ АЛЬБОМОВ) =====================
+# ===================== ПРИЁМ ЗАЯВОК (с пересылкой альбомов) =====================
+
 @dp.message()
 async def handle_submission(message: Message, album: Optional[List[Message]] = None):
     if not await ensure_private_and_autoleave(message): return
     user, user_id = message.from_user, str(message.from_user.id)
-    
-    # Блокировка для предотвращения "гонки состояний"
+
     async with user_submission_locks[user_id]:
-        # Повторная проверка статуса ВНУТРИ блокировки
         if not has_active_request(user_id):
             return
-        
+
         langs = update_user_lang(user_id, user.language_code or "unknown")
         header = make_header(user, langs)
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]]
         )
-        
+
         submission_sent = False
         try:
-            # ===== АЛЬБОМ (включая пересланные) =====
+            # ===== АЛЬБОМ =====
             if album:
-                # Собираем message_id для копирования
-                message_ids = [m.message_id for m in album]
-                # Используем copy_messages для сохранения группировки альбома
-                await bot.copy_messages(
-                    chat_id=ADMIN_CHAT_ID,
-                    from_chat_id=user_id,
-                    message_ids=message_ids
-                )
-                submission_sent = True
-                # Отправляем заголовок и кнопки отдельным сообщением
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-            
-            # ===== ОДИНОЧНОЕ МЕДИА (Фото, Видео, Документ) =====
+                for m in album:
+                    try:
+                        await bot.forward_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            from_chat_id=user_id,
+                            message_id=m.message_id
+                        )
+                        submission_sent = True
+                    except Exception as e:
+                        print(f"[ERROR] Не удалось переслать сообщение альбома: {e}")
+
+                if submission_sent:
+                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+
+            # ===== ОДИНОЧНОЕ МЕДИА =====
             elif message.photo or message.video or message.document:
-                # Копируем сообщение (сохраняет подпись, убирает автора)
-                await bot.copy_message(
+                await bot.forward_message(
                     chat_id=ADMIN_CHAT_ID,
                     from_chat_id=user_id,
                     message_id=message.message_id
                 )
-                # Отправляем заголовок и кнопки отдельным сообщением
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
                 submission_sent = True
-            
-            # ===== ОДИНОЧНОЕ ТЕКСТОВОЕ СООБЩЕНИЕ =====
+
+            # ===== ОДИНОЧНЫЙ ТЕКСТ =====
             elif message.text:
-                # Отправляем текст пользователя
-                await bot.send_message(ADMIN_CHAT_ID, text=message.text)
-                # Отправляем заголовок и кнопки отдельным сообщением
+                await bot.forward_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    from_chat_id=user_id,
+                    message_id=message.message_id
+                )
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
                 submission_sent = True
 
-            # ===== ДРУГИЕ ТИПЫ СООБЩЕНИЙ (стикеры и т.д.) ИГНОРИРУЕМ =====
+            # ===== ДРУГИЕ ТИПЫ =====
             else:
-                return # Молча игнорируем стикеры, аудио и т.д.
+                return
 
-            # Общие действия, если что-то было отправлено
             if submission_sent:
                 await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
                 mark_submitted(user_id)
@@ -348,8 +354,8 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
             await message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
 
-
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
+
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
 async def on_added(event: ChatMemberUpdated):
     if event.chat.id != ADMIN_CHAT_ID:
@@ -369,6 +375,7 @@ async def leave_any_group(message: Message):
             print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
 
 # ===================== MAIN =====================
+
 async def main():
     print(f"[BOOT] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, MAIN_ADMIN_ID={MAIN_ADMIN_ID}, ADMINS={ADMINS}")
     await dp.start_polling(bot)
