@@ -55,17 +55,21 @@ def load_requests() -> Dict[str, dict]:
     now = _now()
     changed = False
     for uid, rec in list(data.items()):
-        started = rec.get("started_at") or rec.get("submitted_at")
-        try:
-            if started and now - datetime.fromisoformat(started) > timedelta(days=3):
+        # Проверяем, что заявка не "вечная" (т.е. у нее есть дата начала)
+        if rec.get("started_at"):
+            started = rec.get("started_at")
+            try:
+                if started and now - datetime.fromisoformat(started) > timedelta(days=3):
+                    del data[uid]
+                    changed = True
+            except (ValueError, TypeError):
+                # Удаляем записи с некорректной датой
                 del data[uid]
                 changed = True
-        except Exception:
-            del data[uid]
-            changed = True
     if changed:
         save_requests(data)
     return data
+
 
 def save_requests(data: Dict[str, dict]) -> None:
     with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
@@ -77,8 +81,9 @@ def update_user_lang(user_id: str, lang: str) -> List[str]:
         "full_name": "",
         "username": "",
         "langs": [],
-        "started_at": None,  # когда пользователь начал оформление (нажал способ оплаты)
-        "submitted": False,  # отправил ли уже СВОЮ единственную заявку
+        "started_at": None,
+        "submitted": False,
+        "has_seen_instructions": False, # [ИЗМЕНЕНО] Поле для запоминания
     }
     if lang and lang not in rec["langs"]:
         rec["langs"].append(lang)
@@ -88,12 +93,18 @@ def update_user_lang(user_id: str, lang: str) -> List[str]:
 
 def start_request(user, langs: List[str]) -> None:
     data = load_requests()
-    data[str(user.id)] = {
+    user_id_str = str(user.id)
+    # [ИЗМЕНЕНО] Сохраняем флаг, если он уже был, чтобы не показывать задержку повторно
+    existing_record = data.get(user_id_str, {})
+    has_seen = existing_record.get("has_seen_instructions", False)
+
+    data[user_id_str] = {
         "full_name": user.full_name,
         "username": user.username or "",
         "langs": langs,
         "started_at": _now().isoformat(),
         "submitted": False,
+        "has_seen_instructions": has_seen,
     }
     save_requests(data)
 
@@ -109,10 +120,14 @@ def can_start_new_request(user_id: str) -> bool:
     rec = data.get(user_id)
     if not rec:
         return True
+    # Если заявка есть, но она не была отправлена, разрешаем начать заново
+    if not rec.get("submitted"):
+        return True
     if not rec.get("started_at"):
         return True
     started = datetime.fromisoformat(rec["started_at"])
     return _now() - started > timedelta(days=3)
+
 
 def has_active_request(user_id: str) -> bool:
     """Можно ли сейчас прислать СВОЁ ЕДИНСТВЕННОЕ сообщение-заявку."""
@@ -158,10 +173,6 @@ def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
 
 # ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
 class AlbumMiddleware(BaseMiddleware):
-    """
-    Склеивает сообщения одного альбома и передаёт их в handler один раз.
-    В data кладёт ключ 'album': List[Message]
-    """
     def __init__(self, wait: float = 0.35):
         super().__init__()
         self.wait = wait
@@ -180,18 +191,15 @@ class AlbumMiddleware(BaseMiddleware):
         group_id = str(event.media_group_id)
         async with self._locks[group_id]:
             self._buffer[group_id].append(event)
-            # ждём до прихода всех частей альбома
             await asyncio.sleep(self.wait)
             messages = self._buffer.pop(group_id, [])
-            # сортировка по ID (чтобы сохранить порядок)
-            messages.sort(key=lambda m: m.message_id)
             if not messages:
                 return
+
+            messages.sort(key=lambda m: m.message_id)
             data["album"] = messages
-            # в handler полетит первый элемент альбома + весь альбом в data
             return await handler(messages[0], data)
 
-# подключаем middleware ТОЛЬКО на сообщения
 dp.message.middleware(AlbumMiddleware())
 
 # ===================== HANDLERS =====================
@@ -200,8 +208,7 @@ async def send_welcome(message: Message):
     if not await ensure_private_and_autoleave(message):
         return
 
-    langs = update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    print(f"[LOG] Пользователь {message.from_user.id} языки: {','.join(langs)}")
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
     price = load_config()["price"]
     caption = (
@@ -229,11 +236,7 @@ async def send_welcome(message: Message):
 
 @dp.message(Command("setprice"))
 async def set_price(message: Message):
-    # только админ-чат
-    if message.chat.id != ADMIN_CHAT_ID:
-        return
-    if message.from_user.id != MAIN_ADMIN_ID:
-        await message.answer("❌ У вас нет прав для изменения цены")
+    if message.chat.id != ADMIN_CHAT_ID or message.from_user.id != MAIN_ADMIN_ID:
         return
 
     args = message.text.split(maxsplit=1)
@@ -250,8 +253,7 @@ async def set_price(message: Message):
 # ---- Кнопки в ЛС ----
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
-    if callback.message.chat.type != "private":
-        return
+    if callback.message.chat.type != "private": return
     await callback.answer()
     price = load_config()["price"]
     keyboard = InlineKeyboardMarkup(
@@ -266,23 +268,21 @@ async def process_premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
 async def ask_screenshots(callback: CallbackQuery):
-    if callback.message.chat.type != "private":
-        return
-    user = callback.from_user
-    langs = update_user_lang(str(user.id), user.language_code or "unknown")
+    if callback.message.chat.type != "private": return
+    await callback.answer()
 
-    if not can_start_new_request(str(user.id)):
+    user = callback.from_user
+    user_id_str = str(user.id)
+    
+    if not can_start_new_request(user_id_str):
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
 
-    start_request(user, langs)
-    preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
-
-    # имитация задержки
-    await asyncio.sleep(random.randint(4234, 10110) / 1000)
+    langs = update_user_lang(user_id_str, user.language_code or "unknown")
+    start_request(user, langs) # Создаем или обновляем запись о начале заявки
 
     instruction = (
-"Наша система сочла ваш аккаунт подозрительным.\n"
+        "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
         "📸 Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
@@ -290,25 +290,50 @@ async def ask_screenshots(callback: CallbackQuery):
         "А также (по желанию) фото прошитого 4G модема.\n\n"
         "⏳ Срок одобрения заявки ~3 дня."
     )
-    await preparing_msg.edit_text(instruction)
+
+    # [ИЗМЕНЕНО] Проверяем, видел ли пользователь инструкцию раньше
+    data = load_requests()
+    user_record = data.get(user_id_str, {})
+    has_seen = user_record.get("has_seen_instructions", False)
+
+    if not has_seen:
+        # Если видит в первый раз - показываем задержку
+        preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
+        await asyncio.sleep(random.randint(4234, 10110) / 1000)
+        await preparing_msg.edit_text(instruction)
+        
+        # Помечаем, что пользователь увидел инструкцию
+        if user_id_str in data:
+            data[user_id_str]["has_seen_instructions"] = True
+            save_requests(data)
+    else:
+        # Если уже видел - отправляем мгновенно
+        await callback.message.answer(instruction)
+
 
 # ---- Кнопки в админ-чате ----
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
-    # только админ-чат
-    if callback.message.chat.id != ADMIN_CHAT_ID:
-        return
+    if callback.message.chat.id != ADMIN_CHAT_ID: return
     if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
         await callback.answer("❌ Нет прав")
         return
 
     user_id = callback.data.split("_", 1)[1]
-    await callback.answer("Заявка отклонена ❌")
+    
+    # [ИЗМЕНЕНО] Удаляем заявку из базы, чтобы пользователь мог подать новую
+    data = load_requests()
+    if user_id in data:
+        del data[user_id]
+        save_requests(data)
+
+    await callback.answer("Заявка отклонена и удалена ❌")
     try:
-        await bot.send_message(user_id, "❌ Ваша заявка на Gene Premium отклонена.")
+        # [ИЗМЕНЕНО] Сообщаем пользователю, что он может попробовать снова
+        await bot.send_message(user_id, "❌ Ваша заявка на Gene Premium отклонена. Вы можете попробовать подать её снова, выбрав способ оплаты в /start.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
-    # прячем кнопки
+    
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -317,83 +342,66 @@ async def reject_request(callback: CallbackQuery):
 # ===================== ПРИЁМ ЗАЯВОК =====================
 @dp.message()
 async def handle_submission(message: Message, album: Optional[List[Message]] = None):
-    """
-    Принимаем ИЛИ одиночное сообщение, ИЛИ альбом (через middleware 'album' в data).
-    Работает только в ЛС. После первой удачной отправки помечаем submitted=True.
-    """
-    if not await ensure_private_and_autoleave(message):
-        return
+    if not await ensure_private_and_autoleave(message): return
 
     user = message.from_user
     user_id = str(user.id)
-    langs = update_user_lang(user_id, user.language_code or "unknown")
 
     if not has_active_request(user_id):
-        # [ИЗМЕНЕНО] Сообщение пользователю было удалено по вашей просьбе.
-        return
+        return # Молча игнорируем, если нет активного процесса подачи заявки
 
+    langs = update_user_lang(user_id, user.language_code or "unknown")
     header = make_header(user, langs)
 
-    # Кнопка для админ-чата (рядом с заявкой)
     admin_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
     )
 
     try:
-        # ===== [ИСПРАВЛЕНО] Альбом (список сообщений) =====
+        # ===== АЛЬБОМ =====
         if album:
             original_caption = album[0].caption or ""
             full_caption = f"{header}\n\n{original_caption}".strip()
             
-            # Разделяем медиа на фото/видео и документы, так как их нельзя смешивать
             photo_video_builder = MediaGroupBuilder()
             doc_builder = MediaGroupBuilder()
 
             for m in album:
-                if m.photo:
-                    photo_video_builder.add_photo(m.photo[-1].file_id)
-                elif m.video:
-                    photo_video_builder.add_video(m.video.file_id)
-                elif m.document:
-                    doc_builder.add_document(m.document.file_id)
+                if m.photo: photo_video_builder.add_photo(m.photo[-1].file_id)
+                elif m.video: photo_video_builder.add_video(m.video.file_id)
+                elif m.document: doc_builder.add_document(m.document.file_id)
             
             caption_sent = False
+            media_sent = False
 
-            # Отправляем группу фото и видео, если они есть
-            if photo_video_builder.media:
-                # Устанавливаем общую подпись для этой группы
-                photo_video_builder.caption = full_caption
-                await bot.send_media_group(ADMIN_CHAT_ID, media=photo_video_builder.build())
+            # [ИСПРАВЛЕНО] Проверяем, есть ли что-то в билдере, перед отправкой
+            pv_built = photo_video_builder.build()
+            if pv_built:
+                pv_built[0].caption = full_caption
+                await bot.send_media_group(ADMIN_CHAT_ID, media=pv_built)
                 caption_sent = True
+                media_sent = True
 
-            # Отправляем группу документов, если они есть
-            if doc_builder.media:
-                # Если подпись еще не была отправлена с фото, добавляем ее к документам
+            doc_built = doc_builder.build()
+            if doc_built:
                 if not caption_sent:
-                    doc_builder.caption = full_caption
-                await bot.send_media_group(ADMIN_CHAT_ID, media=doc_builder.build())
-
-            # Если были отправлены какие-либо медиа, добавляем кнопки управления
-            if photo_video_builder.media or doc_builder.media:
+                    doc_built[0].caption = full_caption
+                await bot.send_media_group(ADMIN_CHAT_ID, media=doc_built)
+                media_sent = True
+            
+            if media_sent:
                 await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
                 await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
                 mark_submitted(user_id)
             
             return
 
-        # ===== Одиночное сообщение =====
-        if message.photo:
-            cap = f"{header}\n\n{message.caption or ''}".strip()
-            await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.document:
-            cap = f"{header}\n\n{message.caption or ''}".strip()
-            await bot.send_document(ADMIN_CHAT_ID, document=message.document.file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.video:
-            cap = f"{header}\n\n{message.caption or ''}".strip()
-            await bot.send_video(ADMIN_CHAT_ID, video=message.video.file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.text:
-            text = f"{header}\n\n{message.text}"
-            await bot.send_message(ADMIN_CHAT_ID, text, reply_markup=admin_keyboard)
+        # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
+        cap = f"{header}\n\n{message.caption or ''}".strip()
+        if message.photo: await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=cap, reply_markup=admin_keyboard)
+        elif message.document: await bot.send_document(ADMIN_CHAT_ID, document=message.document.file_id, caption=cap, reply_markup=admin_keyboard)
+        elif message.video: await bot.send_video(ADMIN_CHAT_ID, video=message.video.file_id, caption=cap, reply_markup=admin_keyboard)
+        elif message.text: await bot.send_message(ADMIN_CHAT_ID, f"{header}\n\n{message.text}", reply_markup=admin_keyboard)
         else:
             await bot.send_message(ADMIN_CHAT_ID, f"{header}\n[Неподдерживаемый тип сообщения]", reply_markup=admin_keyboard)
 
@@ -407,16 +415,13 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
 async def on_added(event: ChatMemberUpdated):
-    # если добавили бота куда-то не в админ-чат — немедленно выходим
-    chat = event.chat
-    if chat.id != ADMIN_CHAT_ID:
+    if event.chat.id != ADMIN_CHAT_ID:
         try:
-            await bot.leave_chat(chat.id)
-            print(f"[LOG] Автовыход из чата {chat.id}")
+            await bot.leave_chat(event.chat.id)
+            print(f"[LOG] Автовыход из чата {event.chat.id}")
         except Exception as e:
-            print(f"[ERROR] Не удалось выйти из чата {chat.id}: {e}")
+            print(f"[ERROR] Не удалось выйти из чата {event.chat.id}: {e}")
 
-# Подстраховка: если вдруг придёт любое сообщение в группе — тоже выйдем
 @dp.message(F.chat.type.in_(["group", "supergroup", "channel"]))
 async def leave_any_group(message: Message):
     if message.chat.id != ADMIN_CHAT_ID:
@@ -432,4 +437,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())```
