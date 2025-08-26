@@ -1,14 +1,17 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import asyncio
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Dict, List, Union
 from html import escape
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.types import (
@@ -20,6 +23,13 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import (
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+)
 
 # ===================== ENV =====================
 load_dotenv(".env.prem")
@@ -31,8 +41,8 @@ ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
 if ADMIN_CHAT_ID == 0:
-    print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.
-Проверь .env.prem")
+    # корректная строка с escape для новой строки
+    print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.\nПроверь .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -49,6 +59,7 @@ submission_buffers: Dict[str, List[Message]] = defaultdict(list)
 collecting_tasks: Dict[str, asyncio.Task] = {}
 
 # ===================== STORAGE =====================
+
 
 def _now() -> datetime:
     return datetime.now()
@@ -146,8 +157,8 @@ def has_active_request(user_id: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-# ===================== CONFIG (цена) =====================
 
+# ===================== CONFIG (цена) =====================
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
@@ -162,7 +173,9 @@ def save_config(config: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
+
 # ===================== HELPERS =====================
+
 
 async def ensure_private_and_autoleave(message: Message) -> bool:
     if message.chat.type != "private":
@@ -175,7 +188,9 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
         return False
     return True
 
+
 # ===================== HANDLERS =====================
+
 
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
@@ -184,14 +199,9 @@ async def send_welcome(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
     price = load_config()["price"]
     caption = (
-        "Добро пожаловать! Я платёжный бот Gene's Land!
-
-"
-        "Здесь вы можете приобрести Premium-версию Gene Brawl!
-
-"
-        "Gene Premium Ultimate выдается навсегда.
-"
+        "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
+        "Здесь вы можете приобрести Premium-версию Gene Brawl!\n\n"
+        "Gene Premium Ultimate выдается навсегда.\n"
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -217,7 +227,9 @@ async def set_price(message: Message):
         await message.answer("Использование: /setprice 15$")
         return
     new_price = args[1].strip()
-    cfg = load_config(); cfg["price"] = new_price; save_config(cfg)
+    cfg = load_config()
+    cfg["price"] = new_price
+    save_config(cfg)
     await message.answer(f"✅ Цена изменена на {new_price}")
 
 
@@ -253,14 +265,9 @@ async def go_home(callback: CallbackQuery):
     # Recreate the welcome screen (try to edit caption if there is photo)
     price = load_config()["price"]
     caption = (
-        "Добро пожаловать! Я платёжный бот Gene's Land!
-
-"
-        "Здесь вы можете приобрести Premium-версию Gene Brawl!
-
-"
-        "Gene Premium Ultimate выдается навсегда.
-"
+        "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
+        "Здесь вы можете приобрести Premium-версию Gene Brawl!\n\n"
+        "Gene Premium Ultimate выдается навсегда.\n"
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -282,7 +289,8 @@ async def go_home(callback: CallbackQuery):
                 except Exception:
                     pass
                 if os.path.exists(WELCOME_IMAGE):
-                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=keyboard)
+                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(WELCOME_IMAGE),
+                                         caption=caption, reply_markup=keyboard)
                 else:
                     await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=keyboard)
     except Exception as e:
@@ -303,21 +311,12 @@ async def ask_screenshots(callback: CallbackQuery):
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
     start_request(user, langs)
     instruction = (
-        "Наша система сочла ваш аккаунт подозрительным.
-"
-        "Для покупки Gene Premium мы обязаны убедиться в вас.
-
-"
-        "📸 Отправьте скриншоты ваших первых сообщений в:
-"
-        "• Brawl Stars Datamines | Чат
-"
-        "• Gene's Land чат
-
-"
-        "А также (по желанию) фото прошитого 4G модема.
-
-"
+        "Наша система сочла ваш аккаунт подозрительным.\n"
+        "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
+        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
+        "• Brawl Stars Datamines | Чат\n"
+        "• Gene's Land чат\n\n"
+        "А также (по желанию) фото прошитого 4G модема.\n\n"
         "⏳ Срок одобрения заявки ~3 дня."
     )
 
@@ -350,8 +349,7 @@ async def reject_request(callback: CallbackQuery):
         del data[user_id]
         save_requests(data)
     try:
-        await bot.send_message(user_id, "❌ Ваша заявка отклонена.
-Вы можете попробовать подать её снова.")
+        await bot.send_message(user_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
     try:
@@ -359,14 +357,8 @@ async def reject_request(callback: CallbackQuery):
     except Exception:
         pass
 
+
 # ===================== ПРИЁМ ЗАЯВОК (с копированием) =====================
-from aiogram.types import (
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaDocument,
-    InputMediaAudio,
-)
-from aiogram.exceptions import TelegramBadRequest
 
 
 # Internal function that actually sends collected messages to admin chat
@@ -384,13 +376,10 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         update_user_lang(user_id_str, user.language_code or "unknown")
 
         # Шапка для админов + клавиатура
-        # Экранируем данные, убираем лишние символы, показываем аккуратно
         safe_full_name = escape(user.full_name or "(без имени)")
         safe_username = f"@{escape(user.username)}" if user.username else ""
         safe_lang = escape(user.language_code or "неизвестно")
-        header = f"{safe_full_name} {safe_username}
-ID: {user.id}
-Язык: {safe_lang}"
+        header = f"{safe_full_name} {safe_username}\nID: {user.id}\nЯзык: {safe_lang}"
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]
@@ -404,9 +393,9 @@ ID: {user.id}
                 album_msgs: List[Message] = sorted(messages, key=lambda m: m.message_id)
 
                 # Если это настоящий альбом — все сообщения имеют одинаковый media_group_id
-                media_group_ids = {getattr(m, 'media_group_id', None) for m in album_msgs}
+                media_group_ids = {getattr(m, "media_group_id", None) for m in album_msgs}
                 if len(media_group_ids) == 1 and next(iter(media_group_ids)) is not None:
-                    # Для альбомов: сначала копируем все медиa (telegram сохранит порядок),
+                    # Для альбомов: копируем все media (telegram сохранит порядок),
                     # затем отправляем шапку с кнопкой
                     for m in album_msgs:
                         await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
@@ -416,7 +405,7 @@ ID: {user.id}
                     # Не альбом — собираем InputMedia и отправляем как media_group когда возможно
                     media_group = []
                     for i, m in enumerate(album_msgs):
-                        caption = getattr(m, 'html_text', None) or getattr(m, 'caption_html', None) or None
+                        caption = getattr(m, "html_text", None) or getattr(m, "caption_html", None) or None
                         cap = caption if i == 0 else None
                         if m.photo:
                             file_id = m.photo[-1].file_id
@@ -444,8 +433,7 @@ ID: {user.id}
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
 
             # уведомляем пользователя и помечаем заявку
-            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.
-Ожидайте ответа.")
+            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.\nОжидайте ответа.")
             mark_submitted(user_id_str)
 
         except TelegramBadRequest as e:
@@ -454,8 +442,7 @@ ID: {user.id}
             await first_message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз (или без подписи).")
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-            await first_message.answer("⚠️ Не удалось отправить администраторам.
-Попробуйте ещё раз позже.")
+            await first_message.answer("⚠️ Не удалось отправить администраторам.\nПопробуйте ещё раз позже.")
 
 
 # Новый обработчик: собирает сообщения от пользователя в буфер и запускает задачу-коллектор
@@ -481,14 +468,13 @@ async def collect_user_messages(message: Message):
     if existing and not existing.done():
         return
 
-    # Создаём задачу, которая подождёт 3 секунды и затем отправит все собранные сообщения
+    # Параллельный коллектор: ждёт 3 секунды и отправляет собранное
     async def _collector(uid: str):
         await asyncio.sleep(3)
         msgs = submission_buffers.pop(uid, [])
         collecting_tasks.pop(uid, None)
         if not msgs:
             return
-        # если в буфере один элемент — передаём как одиночное сообщение
         if len(msgs) == 1:
             await handle_submission(msgs[0])
         else:
