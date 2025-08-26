@@ -32,7 +32,9 @@ if ADMIN_CHAT_ID == 0:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Объект для блокировки одновременной обработки заявок от одного пользователя
+# [НОВАЯ ЛОГИКА] Хранилища для отложенной отправки сообщений
+user_message_buffers = defaultdict(list)
+user_submission_tasks = {}
 user_submission_locks = defaultdict(asyncio.Lock)
 
 REQUESTS_FILE = "requests.json"
@@ -44,31 +46,14 @@ def _now() -> datetime:
     return datetime.now()
 
 def load_requests() -> Dict[str, dict]:
-    if not os.path.exists(REQUESTS_FILE):
-        return {}
+    if not os.path.exists(REQUESTS_FILE): return {}
     try:
         with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
             txt = f.read().strip()
-            data = json.loads(txt) if txt else {}
+            return json.loads(txt) if txt else {}
     except (json.JSONDecodeError, IOError):
-        print(f"[WARN] {REQUESTS_FILE} поврежден или не читается, создаем новый.")
-        data = {}
-
-    now = _now()
-    changed = False
-    for uid, rec in list(data.items()):
-        if rec.get("started_at"):
-            started = rec.get("started_at")
-            try:
-                if started and now - datetime.fromisoformat(started) > timedelta(days=3):
-                    del data[uid]
-                    changed = True
-            except (ValueError, TypeError):
-                del data[uid]
-                changed = True
-    if changed:
-        save_requests(data)
-    return data
+        print(f"[WARN] {REQUESTS_FILE} поврежден, создаем новый.")
+        return {}
 
 def save_requests(data: Dict[str, dict]) -> None:
     try:
@@ -106,36 +91,22 @@ def mark_submitted(user_id: str) -> None:
         data[user_id]["submitted"] = True
         save_requests(data)
 
-def can_start_new_request(user_id: str) -> bool:
-    data = load_requests()
-    rec = data.get(user_id)
-    return not rec or not rec.get("submitted", False)
-
 def has_active_request(user_id: str) -> bool:
     data = load_requests()
     rec = data.get(user_id)
-    if not rec or not rec.get("started_at") or rec.get("submitted"):
-        return False
-    try:
-        started = datetime.fromisoformat(rec["started_at"])
-        return _now() - started <= timedelta(days=3)
-    except (ValueError, TypeError):
-        return False
+    return not (not rec or not rec.get("started_at") or rec.get("submitted"))
 
-# ===================== CONFIG (цена) =====================
+# ===================== CONFIG, HELPERS и т.д. (без изменений) =====================
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f: return json.load(f)
         except (json.JSONDecodeError, IOError): pass
     return {"price": "9$"}
 
 def save_config(config: dict) -> None:
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(config, f, ensure_ascii=False, indent=2)
 
-# ===================== HELPERS =====================
 async def ensure_private_and_autoleave(message: Message) -> bool:
     if message.chat.type != "private":
         if message.chat.id != ADMIN_CHAT_ID:
@@ -152,37 +123,7 @@ def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
     langs_str = ", ".join(langs) or "—"
     return f"{user.full_name} | id {user.id} | {username} | Языки: {langs_str}"
 
-# ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
-class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, wait: float = 1.0): # Таймер в 1 секунду
-        super().__init__()
-        self.wait = wait
-        self._buffer: Dict[str, List[Message]] = defaultdict(list)
-        self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-    async def __call__(
-        self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-        event: Message,
-        data: Dict[str, Any]
-    ) -> Any:
-        if not isinstance(event, Message) or not event.media_group_id:
-            return await handler(event, data)
-
-        group_id = str(event.media_group_id)
-        async with self._locks[group_id]:
-            self._buffer[group_id].append(event)
-            await asyncio.sleep(self.wait)
-            messages = self._buffer.pop(group_id, [])
-            if not messages: return
-
-            messages.sort(key=lambda m: m.message_id)
-            data["album"] = messages
-            return await handler(messages[0], data)
-
-dp.message.middleware(AlbumMiddleware(wait=1.0))
-
-# ===================== HANDLERS =====================
+# ===================== HANDLERS (без AlbumMiddleware) =====================
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
     if not await ensure_private_and_autoleave(message): return
@@ -201,11 +142,8 @@ async def send_welcome(message: Message):
     if os.path.exists(WELCOME_IMAGE):
         try:
             await message.answer_photo(photo=FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=keyboard)
-        except Exception as e:
-            print(f"[WARN] Не удалось отправить локальную картинку: {e}")
-            await message.answer(caption, reply_markup=keyboard)
-    else:
-        await message.answer(caption, reply_markup=keyboard)
+        except Exception: await message.answer(caption, reply_markup=keyboard)
+    else: await message.answer(caption, reply_markup=keyboard)
 
 @dp.message(Command("setprice"))
 async def set_price(message: Message):
@@ -221,7 +159,6 @@ async def set_price(message: Message):
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
     await callback.answer()
-    if callback.message.chat.type != "private": return
     price = load_config()["price"]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Описание", url="https://t.me/GenePremium/6")],
@@ -234,27 +171,27 @@ async def process_premium(callback: CallbackQuery):
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
 async def ask_screenshots(callback: CallbackQuery):
     await callback.answer()
-    if callback.message.chat.type != "private": return
     user, user_id_str = callback.from_user, str(callback.from_user.id)
-    if not can_start_new_request(user_id_str):
+    
+    # Проверяем, есть ли уже отправленная заявка
+    data = load_requests()
+    if data.get(user_id_str) and data[user_id_str].get("submitted"):
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
+
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
     start_request(user, langs)
     instruction = (
-        "Наша система сочла ваш аккаунт подозрительным.\n"
-        "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
+        "Наша система сочла ваш аккаунт подозрительным...\n\n"
         "📸 Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
         "• Gene's Land чат\n\n"
-        "А также (по желанию) фото прошитого 4G модема.\n\n"
         "⏳ Срок одобрения заявки ~3 дня."
     )
-    data = load_requests()
     user_record = data.get(user_id_str, {})
     if not user_record.get("has_seen_instructions", False):
         preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
-        await asyncio.sleep(random.randint(4234, 10110) / 1000)
+        await asyncio.sleep(random.uniform(4.2, 10.1))
         await preparing_msg.edit_text(instruction)
         if user_id_str in data:
             data[user_id_str]["has_seen_instructions"] = True
@@ -264,98 +201,79 @@ async def ask_screenshots(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
-    await callback.answer("Заявка отклонена и удалена ❌")
-    if callback.message.chat.id != ADMIN_CHAT_ID: return
-    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
-        return
+    await callback.answer("Заявка отклонена и удалена ❌", show_alert=True)
+    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID: return
+    
     user_id = callback.data.split("_", 1)[1]
     data = load_requests()
     if user_id in data:
         del data[user_id]
         save_requests(data)
-    try:
-        await bot.send_message(user_id, "❌ Ваша заявка отклонена. Вы можете попробовать подать её снова, выбрав способ оплаты в /start.")
-    except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+    
+    try: await bot.send_message(user_id, "❌ Ваша заявка отклонена. Можете попробовать подать её снова.")
+    except Exception as e: print(f"[WARN] Не удалось уведомить {user_id}: {e}")
+    try: await callback.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
 
-# ===================== ПРИЁМ ЗАЯВОК (ПОЛНОСТЬЮ ПЕРЕПИСАН) =====================
+# ===================== ПРИЁМ ЗАЯВОК (НОВАЯ, НАДЕЖНАЯ ЛОГИКА) =====================
 @dp.message()
-async def handle_submission(message: Message, album: Optional[List[Message]] = None):
+async def handle_submission(message: Message):
     if not await ensure_private_and_autoleave(message): return
-    user, user_id = message.from_user, str(message.from_user.id)
     
-    # Блокировка для предотвращения "гонки состояний" (зуй/быыыы)
+    user_id = str(message.from_user.id)
+    
+    # Блокируем, чтобы избежать хаоса при одновременной обработке
     async with user_submission_locks[user_id]:
-        # Повторная проверка статуса ВНУТРИ блокировки
         if not has_active_request(user_id):
             return
         
-        langs = update_user_lang(user_id, user.language_code or "unknown")
-        header = make_header(user, langs)
-        admin_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]]
-        )
+        # Добавляем текущее сообщение в буфер пользователя
+        user_message_buffers[user_id].append(message)
         
-        submission_sent = False
+        # Если таймер для этого пользователя еще не запущен, запускаем его
+        if user_id not in user_submission_tasks:
+            task = asyncio.create_task(_process_user_submission(message.from_user))
+            user_submission_tasks[user_id] = task
+
+async def _process_user_submission(user: "aiogram.types.User"):
+    user_id = str(user.id)
+    
+    # Ждем 2 секунды, чтобы собрать все сообщения
+    await asyncio.sleep(2)
+    
+    # Снова блокируем, чтобы безопасно забрать сообщения из буфера
+    async with user_submission_locks[user_id]:
+        messages_to_forward = user_message_buffers.pop(user_id, [])
+        user_submission_tasks.pop(user_id, None) # Удаляем задачу
+        
+        if not messages_to_forward:
+            return
+
         try:
-            # ===== АЛЬБОМ =====
-            if album:
-                pv_builder, doc_builder = MediaGroupBuilder(), MediaGroupBuilder()
-                # Собираем медиа БЕЗ подписи
-                for m in album:
-                    if m.photo: pv_builder.add_photo(m.photo[-1].file_id)
-                    elif m.video: pv_builder.add_video(m.video.file_id)
-                    elif m.document: doc_builder.add_document(m.document.file_id)
-                
-                pv_built = pv_builder.build()
-                if pv_built:
-                    await bot.send_media_group(ADMIN_CHAT_ID, media=pv_built)
-                    submission_sent = True
-                
-                doc_built = doc_builder.build()
-                if doc_built:
-                    await bot.send_media_group(ADMIN_CHAT_ID, media=doc_built)
-                    submission_sent = True
-                
-                if submission_sent:
-                    # Отправляем заголовок и кнопки отдельным сообщением
-                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-            
-            # ===== ОДИНОЧНОЕ МЕДИА (Фото, Видео, Документ) =====
-            elif message.photo or message.video or message.document:
-                # Копируем сообщение (сохраняет подпись, убирает автора)
-                await bot.copy_message(
+            # 1. Пересылаем все собранные сообщения
+            for msg in messages_to_forward:
+                await bot.forward_message(
                     chat_id=ADMIN_CHAT_ID,
                     from_chat_id=user_id,
-                    message_id=message.message_id
+                    message_id=msg.message_id
                 )
-                # Отправляем заголовок и кнопки отдельным сообщением
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
             
-            # ===== ОДИНОЧНОЕ ТЕКСТОВОЕ СООБЩЕНИЕ =====
-            elif message.text:
-                # Отправляем текст пользователя
-                await bot.send_message(ADMIN_CHAT_ID, text=message.text)
-                # Отправляем заголовок и кнопки отдельным сообщением
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
-
-            # ===== ДРУГИЕ ТИПЫ СООБЩЕНИЙ (стикеры и т.д.) ИГНОРИРУЕМ =====
-            else:
-                return # Молча игнорируем стикеры, аудио и т.д.
-
-            # Общие действия, если что-то было отправлено
-            if submission_sent:
-                await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-                mark_submitted(user_id)
+            # 2. Отправляем информацию о пользователе и кнопки управления
+            langs = update_user_lang(user_id, user.language_code or "unknown")
+            header = make_header(user, langs)
+            admin_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]]
+            )
+            await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+            
+            # 3. Уведомляем пользователя и помечаем заявку
+            await messages_to_forward[0].answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
+            mark_submitted(user_id)
 
         except Exception as e:
-            print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-            await message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
+            print(f"[ERROR] Не удалось отправить заявку от {user_id} в админ-чат: {e}")
+            await messages_to_forward[0].answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
+
 
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
@@ -363,18 +281,14 @@ async def on_added(event: ChatMemberUpdated):
     if event.chat.id != ADMIN_CHAT_ID:
         try:
             await bot.leave_chat(event.chat.id)
-            print(f"[LOG] Автовыход из чата {event.chat.id}")
-        except Exception as e:
-            print(f"[ERROR] Не удалось выйти из чата {event.chat.id}: {e}")
+        except Exception: pass
 
 @dp.message(F.chat.type.in_(["group", "supergroup", "channel"]))
 async def leave_any_group(message: Message):
     if message.chat.id != ADMIN_CHAT_ID:
         try:
             await bot.leave_chat(message.chat.id)
-            print(f"[LOG] Вышел из чата по сообщению {message.chat.id}")
-        except Exception as e:
-            print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
+        except Exception: pass
 
 # ===================== MAIN =====================
 async def main():
