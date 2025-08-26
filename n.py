@@ -4,7 +4,7 @@ import asyncio
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 from html import escape
 
 from dotenv import load_dotenv
@@ -58,7 +58,7 @@ collecting_tasks: Dict[str, asyncio.Task] = {}
 # mapping admin chat message_id -> user_id (для reply из админ-чата)
 admin_message_to_user: Dict[int, int] = {}
 
-# ===================== STORAGE =====================
+# ===================== STORAGE & BANS =====================
 
 
 def _now() -> datetime:
@@ -71,25 +71,10 @@ def load_requests() -> Dict[str, dict]:
     try:
         with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
             txt = f.read().strip()
-            data = json.loads(txt) if txt else {}
+            return json.loads(txt) if txt else {}
     except (json.JSONDecodeError, IOError):
         print(f"[WARN] {REQUESTS_FILE} поврежден или не читается, создаем новый.")
-        data = {}
-    now = _now()
-    changed = False
-    for uid, rec in list(data.items()):
-        if rec.get("started_at"):
-            started = rec.get("started_at")
-            try:
-                if started and now - datetime.fromisoformat(started) > timedelta(days=3):
-                    del data[uid]
-                    changed = True
-            except (ValueError, TypeError):
-                del data[uid]
-                changed = True
-    if changed:
-        save_requests(data)
-    return data
+        return {}
 
 
 def save_requests(data: Dict[str, dict]) -> None:
@@ -105,7 +90,9 @@ def load_banned() -> List[int]:
         return []
     try:
         with open(BANNED_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = json.load(f)
+            # приводим к int
+            return [int(x) for x in raw if x is not None]
     except Exception:
         return []
 
@@ -125,8 +112,22 @@ def ban_user_by_id(uid: int) -> None:
         save_banned(b)
 
 
-def is_banned(uid: int) -> bool:
-    return uid in load_banned()
+def unban_user_by_id(uid: int) -> None:
+    b = load_banned()
+    if uid in b:
+        b.remove(uid)
+        save_banned(b)
+
+
+def is_banned(uid: Union[int, str]) -> bool:
+    try:
+        uid_int = int(uid)
+    except Exception:
+        return False
+    return uid_int in load_banned()
+
+
+# ===================== REQUESTS / LANGS =====================
 
 
 def update_user_lang(user_id: str, lang: str) -> List[str]:
@@ -172,9 +173,22 @@ def mark_submitted(user_id: str) -> None:
         save_requests(data)
 
 
+def remove_request(user_id: str) -> None:
+    data = load_requests()
+    if user_id in data:
+        del data[user_id]
+        save_requests(data)
+
+
 def can_start_new_request(user_id: str) -> bool:
-    if is_banned(int(user_id)):
-        return False
+    """
+    Проверка: не забанен ли пользователь и не подавал ли он уже заявку.
+    """
+    try:
+        if is_banned(int(user_id)):
+            return False
+    except Exception:
+        pass
     data = load_requests()
     rec = data.get(user_id)
     return not rec or not rec.get("submitted", False)
@@ -223,6 +237,23 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
     return True
 
 
+async def notify_if_banned(user_id: Union[int, str]) -> bool:
+    """
+    Возвращает True если пользователь забанен (и уже уведомлен).
+    """
+    try:
+        uid = int(user_id)
+    except Exception:
+        return False
+    if is_banned(uid):
+        try:
+            await bot.send_message(uid, "🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        except Exception:
+            pass
+        return True
+    return False
+
+
 # ===================== HANDLERS =====================
 
 
@@ -230,6 +261,11 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
 async def send_welcome(message: Message):
     # логируем язык при команде start
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # если забанен — не продолжать
+    if is_banned(message.from_user.id):
+        await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        return
 
     if not await ensure_private_and_autoleave(message):
         return
@@ -241,8 +277,8 @@ async def send_welcome(message: Message):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f" Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text=" Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
     if os.path.exists(WELCOME_IMAGE):
         try:
@@ -277,16 +313,24 @@ async def process_premium(callback: CallbackQuery):
     # логируем язык на нажатие кнопки Premium
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
+    # если забанен — не продолжать
+    if is_banned(callback.from_user.id):
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        try:
+            await bot.send_message(callback.from_user.id, "🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        except Exception:
+            pass
+        return
+
     await callback.answer()
     if callback.message.chat.type != "private":
         return
-    # Build payment keyboard with emojis and Home button
+    # Build payment keyboard with emojis and Home button (убрал плейсхолдер блокировки)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
-        [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="💳 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🪙 Crypto (@send) (0%)", callback_data="pay_crypto")],
         [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="🔒 Заблокировать (только админы)", callback_data="noop")],  # placeholder in user UI
-        [InlineKeyboardButton(text="🏠", callback_data="home")],
+        [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
     ])
 
     # Instead of sending a new separate message with price, edit the original message/caption
@@ -304,6 +348,15 @@ async def process_premium(callback: CallbackQuery):
 async def go_home(callback: CallbackQuery):
     # логируем язык при возврате домой
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
+    # если забанен — не продолжать
+    if is_banned(callback.from_user.id):
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        try:
+            await bot.send_message(callback.from_user.id, "🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        except Exception:
+            pass
+        return
 
     await callback.answer()
     if callback.message.chat.type != "private":
@@ -350,6 +403,15 @@ async def ask_screenshots(callback: CallbackQuery):
     # логируем язык при выборе способа оплаты
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
+    # если забанен — не продолжать
+    if is_banned(callback.from_user.id):
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        try:
+            await bot.send_message(callback.from_user.id, "🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        except Exception:
+            pass
+        return
+
     await callback.answer()
     if callback.message.chat.type != "private":
         return
@@ -362,7 +424,7 @@ async def ask_screenshots(callback: CallbackQuery):
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
-        "Отправьте скриншоты ваших первых сообщений в:\n"
+        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
         "• Gene's Land чат\n\n"
         "А также (по желанию) фото прошитого 4G модема.\n\n"
@@ -419,19 +481,121 @@ async def ban_request(callback: CallbackQuery):
         return
     if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
         return
+
     user_id = callback.data.split("_", 1)[1]
     try:
-        ban_user_by_id(int(user_id))
-    except Exception as e:
-        print(f"[WARN] Не удалось заблокировать {user_id}: {e}")
-    data = load_requests()
-    if user_id in data:
-        del data[user_id]
-        save_requests(data)
+        uid = int(user_id)
+    except Exception:
+        await callback.message.answer("Неверный id для блокировки.")
+        return
+
     try:
-        await bot.send_message(user_id, "🔒 Вы были заблокированы.")
+        # 1) забанить
+        ban_user_by_id(uid)
+        # 2) закрыть/удалить заявку (если есть)
+        remove_request(str(uid))
+        # 3) очистить буфер и отменить задачи
+        submission_buffers.pop(str(uid), None)
+        task = collecting_tasks.pop(str(uid), None)
+        if task and not task.done():
+            task.cancel()
     except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
+        print(f"[WARN] Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
+
+    try:
+        await bot.send_message(uid, "🔒 Вы были заблокированы. Связаться с поддержкой нельзя.")
+    except Exception as e:
+        print(f"[WARN] Не удалось уведомить пользователя {uid}: {e}")
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+# ------------------ UNBAN: команда и callback ------------------
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """
+    /unban <user_id>  - разблокировать пользователя по id
+    Также можно reply'ом на сообщение в админ-чате вызвать /unban (бот попытается достать user_id из admin_message_to_user)
+    """
+    # Только админы
+    if message.from_user.id not in ADMINS and message.from_user.id != MAIN_ADMIN_ID:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    target_id: Optional[int] = None
+    if len(parts) > 1 and parts[1].strip():
+        try:
+            target_id = int(parts[1].strip())
+        except ValueError:
+            await message.reply("Неверный id. Использование: /unban <user_id>")
+            return
+    else:
+        # Если команда дана в reply на сообщение в админ-чате, попробуем восстановить user_id через mapping
+        if message.reply_to_message:
+            replied_id = message.reply_to_message.message_id
+            target_id = admin_message_to_user.get(replied_id)
+        if not target_id:
+            await message.reply("Укажите id: /unban <user_id> или выполните команду через reply на сообщении бота в админ-чате.")
+            return
+
+    banned = load_banned()
+    if target_id not in banned:
+        await message.reply(f"Пользователь {target_id} не в списке заблокированных.")
+        return
+
+    try:
+        unban_user_by_id(target_id)
+    except Exception as e:
+        await message.reply(f"Ошибка при разблокировке: {e}")
+        return
+
+    await message.reply(f"✅ Пользователь {target_id} разблокирован.")
+    try:
+        await bot.send_message(chat_id=target_id, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def unban_request(callback: CallbackQuery):
+    await callback.answer()
+    if callback.message.chat.id != ADMIN_CHAT_ID:
+        return
+    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
+        return
+
+    user_id = callback.data.split("_", 1)[1]
+    try:
+        uid = int(user_id)
+    except Exception:
+        await callback.message.answer("Неверный id для разблокировки.")
+        return
+
+    banned = load_banned()
+    if uid not in banned:
+        await callback.message.answer("Пользователь уже не заблокирован.")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    try:
+        unban_user_by_id(uid)
+    except Exception as e:
+        await callback.message.answer(f"Ошибка при сохранении: {e}")
+        return
+
+    await callback.message.answer(f"✅ Пользователь {uid} разблокирован.")
+    try:
+        await bot.send_message(chat_id=uid, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
+    except Exception:
+        pass
+
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -450,6 +614,22 @@ async def handle_submission(messages: Union[Message, List[Message]]):
     user = first_message.from_user
     user_id_str = str(user.id)
 
+    # если забанен — ничего не отправляем (удаляем локально заявку)
+    if is_banned(user.id):
+        remove_request(user_id_str)
+        submission_buffers.pop(user_id_str, None)
+        task = collecting_tasks.pop(user_id_str, None)
+        if task and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        try:
+            await bot.send_message(chat_id=user.id, text="🔒 Вы заблокированы. Ваша заявка удалена.")
+        except Exception:
+            pass
+        return
+
     async with user_submission_locks[user_id_str]:
         if not has_active_request(user_id_str):
             return
@@ -460,7 +640,7 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         safe_username = f"@{escape(user.username)}" if user.username else ""
         data = load_requests()
         langs = data.get(user_id_str, {}).get("langs", [user.language_code or "неизвестно"])
-        safe_langs = ", ".join([escape(x) for x in langs])
+        safe_langs = ", ".join([escape(str(x)) for x in langs])
         header = f"{safe_full_name} {safe_username}\nID: {user.id}\nЯзыки: {safe_langs}"
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -482,7 +662,6 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                     # затем отправляем шапку с кнопкой
                     for m in album_msgs:
                         res = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
-                        # связываем скопированное сообщение с user_id
                         admin_message_to_user[res.message_id] = int(user.id)
                     header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
                     admin_message_to_user[header_msg.message_id] = int(user.id)
@@ -508,7 +687,6 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                             admin_message_to_user[res.message_id] = int(user.id)
                     if media_group:
                         sent = await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media_group)
-                        # sent — список сообщений, свяжем все с user_id
                         for s in sent:
                             admin_message_to_user[s.message_id] = int(user.id)
                         header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
@@ -541,6 +719,23 @@ async def handle_submission(messages: Union[Message, List[Message]]):
 async def collect_user_messages(message: Message):
     # логируем язык при любом личном сообщении
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # если забанен — не обрабатывать и уведомить коротко
+    if is_banned(message.from_user.id):
+        # удаляем заявку и буфер если есть
+        remove_request(str(message.from_user.id))
+        submission_buffers.pop(str(message.from_user.id), None)
+        task = collecting_tasks.pop(str(message.from_user.id), None)
+        if task and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        try:
+            await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        except Exception:
+            pass
+        return
 
     if not await ensure_private_and_autoleave(message):
         return
@@ -604,6 +799,11 @@ async def admin_reply_handler(message: Message):
 
     # логируем язык админа (опционально)
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # если пользователь целевой забанен — предупредим админа и не отправим
+    if is_banned(target_user_id):
+        await message.reply("⚠️ Этот пользователь заблокирован. Ответ не отправлен.", quote=False)
+        return
 
     try:
         # копируем сообщение из админ-чата в чат пользователя
