@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import asyncio
@@ -28,17 +31,52 @@ from aiogram.types import (
     InputMediaAudio,
 )
 
-# ===================== ENV =====================
+# ===================== ENV (robust parsing for multiple IDs) =====================
 load_dotenv(".env.prem")
-API_TOKEN = os.getenv("BOT_TOKEN2")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-MAIN_ADMIN_ID = int(os.getenv("MAIN_ADMIN_ID", "0"))
-ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 
+
+def _parse_int_list(env_name: str) -> List[int]:
+    """Распарсить список целых из переменной окружения.
+    Разделители: запятая, точка с запятой или пробел.
+    Нечисловые символы в части будут удалены, если останутся цифры — то будут использованы."""
+    raw = os.getenv(env_name, "")
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    parts = []
+    for part in [p.strip() for p in s.replace(";", ",").replace(" ", ",").split(",")]:
+        if not part:
+            continue
+        try:
+            parts.append(int(part))
+            continue
+        except Exception:
+            digits = "".join(ch for ch in part if ch.isdigit())
+            if digits:
+                try:
+                    parts.append(int(digits))
+                except Exception:
+                    pass
+    return parts
+
+
+# Parse:
+ADMIN_CHAT_IDS = _parse_int_list("ADMIN_CHAT_ID")  # можно указать несколько chat id
+ADMIN_CHAT_ID = ADMIN_CHAT_IDS[0] if ADMIN_CHAT_IDS else 0
+MAIN_ADMIN_IDS = _parse_int_list("MAIN_ADMIN_ID")
+ADMINS = _parse_int_list("ADMINS")
+
+# Combined admin sets for permission checks
+ALL_ADMINS_SET = set(ADMINS) | set(MAIN_ADMIN_IDS)
+
+print(f"[ENV] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+
+# ===================== Bot init =====================
+API_TOKEN = os.getenv("BOT_TOKEN2")
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
-if ADMIN_CHAT_ID == 0:
-    print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.\nПроверь .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -57,7 +95,6 @@ submission_buffers: Dict[str, List[Message]] = defaultdict(list)
 collecting_tasks: Dict[str, asyncio.Task] = {}
 
 # mapping admin chat message_id -> user_id (для reply из админ-чата)
-# загружается из ADMIN_MAP_FILE при старте
 admin_message_to_user: Dict[int, int] = {}
 
 # ===================== STORAGE & MAPS & BANS =====================
@@ -134,7 +171,6 @@ def load_admin_map() -> Dict[int, int]:
     try:
         with open(ADMIN_MAP_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-            # ключи в файле храним как строки, приводим к int
             return {int(k): int(v) for k, v in (raw.items() if isinstance(raw, dict) else {})}
     except Exception:
         return {}
@@ -142,7 +178,6 @@ def load_admin_map() -> Dict[int, int]:
 
 def save_admin_map(m: Dict[int, int]) -> None:
     try:
-        # сохраняем ключи как строки (json стандарт)
         raw = {str(k): v for k, v in m.items()}
         with open(ADMIN_MAP_FILE, "w", encoding="utf-8") as f:
             json.dump(raw, f, ensure_ascii=False, indent=2)
@@ -166,7 +201,6 @@ try:
     admin_message_to_user = load_admin_map()
 except Exception:
     admin_message_to_user = {}
-
 
 # ===================== REQUESTS / LANGS =====================
 
@@ -262,7 +296,7 @@ def save_config(config: dict) -> None:
 
 async def ensure_private_and_autoleave(message: Message) -> bool:
     if message.chat.type != "private":
-        if message.chat.id != ADMIN_CHAT_ID:
+        if message.chat.id not in ADMIN_CHAT_IDS:
             try:
                 await bot.leave_chat(message.chat.id)
                 print(f"[LOG] Вышел из чата {message.chat.id}")
@@ -270,6 +304,40 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
                 print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
         return False
     return True
+
+
+# ===================== EDIT ORIGINAL HELPERS =====================
+
+async def _try_edit_original_message(chat_id: int, message_id: int, text: str, reply_markup, prefer_caption: bool) -> bool:
+    """
+    Пытается отредактировать существующее сообщение (chat_id/message_id).
+    Возвращает True если одно из редактирований прошло.
+    prefer_caption = True -> сначала пробуем edit_message_caption, затем edit_message_text.
+    """
+    # 1) Попытка 1 — предпочитаем caption (когда сообщение медиа)
+    if prefer_caption:
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+            return True
+        except Exception:
+            pass
+
+    # 2) Попытка 2 — edit text
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+
+    # 3) Попытка 3 — если не пробовали caption в начале, попробуем сейчас
+    try:
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+
+    # 4) Всё упало
+    return False
 
 
 # ===================== HANDLERS =====================
@@ -293,8 +361,8 @@ async def send_welcome(message: Message):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f" Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text=" Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f" 🥳 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text=" 🪄 Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
     if os.path.exists(WELCOME_IMAGE):
         try:
@@ -310,7 +378,8 @@ async def send_welcome(message: Message):
 async def set_price(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
-    if message.chat.id != ADMIN_CHAT_ID or message.from_user.id != MAIN_ADMIN_ID:
+    # разрешено только мейн-админам
+    if message.from_user.id not in MAIN_ADMIN_IDS:
         return
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip():
@@ -325,15 +394,15 @@ async def set_price(message: Message):
 
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
+    # логируем язык на нажатие кнопки Premium
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
+    # если забанен — не продолжать
     if is_banned(callback.from_user.id):
         await callback.answer("🔒 Вы заблокированы.", show_alert=True)
         return
 
-    await callback.answer()
-    if callback.message.chat.type != "private":
-        return
+    # построим клавиатуру оплаты
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
         [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
@@ -341,26 +410,39 @@ async def process_premium(callback: CallbackQuery):
         [InlineKeyboardButton(text="🏠", callback_data="home")],
     ])
 
-    try:
-        if callback.message.photo:
-            await callback.message.edit_caption("Вы выбрали Premium", reply_markup=keyboard)
-        else:
-            await callback.message.edit_text("Вы выбрали Premium", reply_markup=keyboard)
-    except Exception:
-        await callback.message.answer("Вы выбрали Premium", reply_markup=keyboard)
+    # Собираем параметры для редактирования оригинала
+    orig_chat_id = callback.message.chat.id
+    orig_msg_id = callback.message.message_id
+
+    # Определяем, предпочтителен ли caption (если исходное сообщение содержит медиа)
+    content_type = getattr(callback.message, "content_type", None)
+    prefer_caption = content_type in ("photo", "video", "document", "animation") or bool(getattr(callback.message, "photo", None))
+
+    # Текст, который хотим поместить
+    new_text = "Вы выбрали Premium"
+
+    # Пытаемся отредактировать оригинал (несколько попыток внутри функции)
+    ok = await _try_edit_original_message(orig_chat_id, orig_msg_id, new_text, keyboard, prefer_caption)
+
+    if ok:
+        # Успешно отредактировали оригинал — подтверждаем взаимодействие (тихо)
+        await callback.answer()
+        return
+
+    # Если редактирование не удалось — сообщаем пользователю (не создаём новый message по вашей просьбе)
+    await callback.answer("⚠️ Не удалось обновить сообщение. Попробуйте ещё раз.", show_alert=True)
 
 
 @dp.callback_query(F.data == "home")
 async def go_home(callback: CallbackQuery):
+    # логируем язык при возврате домой
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
+    # если забанен — не продолжать
     if is_banned(callback.from_user.id):
         await callback.answer("🔒 Вы заблокированы.", show_alert=True)
         return
 
-    await callback.answer()
-    if callback.message.chat.type != "private":
-        return
     price = load_config()["price"]
     caption = (
         "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
@@ -369,28 +451,24 @@ async def go_home(callback: CallbackQuery):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f" 🥳 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text=" 🪄 Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
-    try:
-        if os.path.exists(WELCOME_IMAGE) and callback.message.photo:
-            await callback.message.edit_caption(caption, reply_markup=keyboard)
-        else:
-            try:
-                await callback.message.edit_text(caption, reply_markup=keyboard)
-            except Exception:
-                try:
-                    await callback.message.delete()
-                except Exception:
-                    pass
-                if os.path.exists(WELCOME_IMAGE):
-                    await bot.send_photo(chat_id=callback.from_user.id, photo=FSInputFile(WELCOME_IMAGE),
-                                         caption=caption, reply_markup=keyboard)
-                else:
-                    await bot.send_message(chat_id=callback.from_user.id, text=caption, reply_markup=keyboard)
-    except Exception as e:
-        print(f"[WARN] Не удалось вернуть домой: {e}")
-        await callback.message.answer(caption, reply_markup=keyboard)
+
+    orig_chat_id = callback.message.chat.id
+    orig_msg_id = callback.message.message_id
+
+    content_type = getattr(callback.message, "content_type", None)
+    prefer_caption = content_type in ("photo", "video", "document", "animation") or bool(getattr(callback.message, "photo", None))
+
+    ok = await _try_edit_original_message(orig_chat_id, orig_msg_id, caption, keyboard, prefer_caption)
+
+    if ok:
+        await callback.answer()
+        return
+
+    # Если редактирование не удалось — уведомляем адекватно
+    await callback.answer("⚠️ Не удалось обновить приветствие. Попробуйте ещё раз.", show_alert=True)
 
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
@@ -438,9 +516,9 @@ async def reject_request(callback: CallbackQuery):
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
     await callback.answer("Заявка отклонена и удалена ❌")
-    if callback.message.chat.id != ADMIN_CHAT_ID:
+    if callback.message.chat.id not in ADMIN_CHAT_IDS:
         return
-    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
+    if callback.from_user.id not in ALL_ADMINS_SET:
         return
     user_id = callback.data.split("_", 1)[1]
     data = load_requests()
@@ -462,9 +540,9 @@ async def ban_request(callback: CallbackQuery):
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
     await callback.answer("Пользователь заблокирован 🔒")
-    if callback.message.chat.id != ADMIN_CHAT_ID:
+    if callback.message.chat.id not in ADMIN_CHAT_IDS:
         return
-    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
+    if callback.from_user.id not in ALL_ADMINS_SET:
         return
 
     user_id = callback.data.split("_", 1)[1]
@@ -502,7 +580,7 @@ async def ban_request(callback: CallbackQuery):
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: Message):
-    if message.from_user.id not in ADMINS and message.from_user.id != MAIN_ADMIN_ID:
+    if message.from_user.id not in ALL_ADMINS_SET:
         return
 
     parts = message.text.split(maxsplit=1)
@@ -542,9 +620,9 @@ async def cmd_unban(message: Message):
 @dp.callback_query(F.data.startswith("unban_"))
 async def unban_request(callback: CallbackQuery):
     await callback.answer()
-    if callback.message.chat.id != ADMIN_CHAT_ID:
+    if callback.message.chat.id not in ADMIN_CHAT_IDS:
         return
-    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
+    if callback.from_user.id not in ALL_ADMINS_SET:
         return
 
     user_id = callback.data.split("_", 1)[1]
@@ -583,8 +661,7 @@ async def unban_request(callback: CallbackQuery):
 
 @dp.message(Command("banned"))
 async def cmd_banned(message: Message):
-    """Показать список забаненных (только админы)."""
-    if message.from_user.id not in ADMINS and message.from_user.id != MAIN_ADMIN_ID:
+    if message.from_user.id not in ALL_ADMINS_SET:
         return
     banned = load_banned()
     if not banned:
@@ -678,7 +755,7 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                 header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
                 set_admin_map(header_msg.message_id, int(user.id))
 
-            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена.\nОжидайте ответа.")
+            await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.\nОжидайте ответа.")
             mark_submitted(user_id_str)
 
         except TelegramBadRequest as e:
@@ -739,9 +816,10 @@ async def collect_user_messages(message: Message):
 
 
 # ===================== АДМИН: ответ reply -> пользователю =====================
-@dp.message(F.chat.id == ADMIN_CHAT_ID)
+@dp.message(F.chat.id.in_(ADMIN_CHAT_IDS) if ADMIN_CHAT_IDS else F.chat.id == ADMIN_CHAT_ID)
 async def admin_reply_handler(message: Message):
-    if message.from_user.id not in ADMINS and message.from_user.id != MAIN_ADMIN_ID:
+    # разрешаем только админам
+    if message.from_user.id not in ALL_ADMINS_SET:
         return
 
     if not message.reply_to_message:
@@ -777,7 +855,7 @@ async def admin_reply_handler(message: Message):
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
 async def on_added(event: ChatMemberUpdated):
-    if event.chat.id != ADMIN_CHAT_ID:
+    if event.chat.id not in ADMIN_CHAT_IDS:
         try:
             await bot.leave_chat(event.chat.id)
             print(f"[LOG] Автовыход из чата {event.chat.id}")
@@ -787,7 +865,7 @@ async def on_added(event: ChatMemberUpdated):
 
 @dp.message(F.chat.type.in_(["group", "supergroup", "channel"]))
 async def leave_any_group(message: Message):
-    if message.chat.id != ADMIN_CHAT_ID:
+    if message.chat.id not in ADMIN_CHAT_IDS:
         try:
             await bot.leave_chat(message.chat.id)
             print(f"[LOG] Вышел из чата по сообщению {message.chat.id}")
@@ -797,11 +875,9 @@ async def leave_any_group(message: Message):
 
 # ===================== MAIN =====================
 async def main():
-    print(f"[BOOT] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, MAIN_ADMIN_ID={MAIN_ADMIN_ID}, ADMINS={ADMINS}")
+    print(f"[BOOT] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
     asyncio.run(main())
