@@ -32,7 +32,7 @@ if ADMIN_CHAT_ID == 0:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# [ДОБАВЛЕНО] Объект для блокировки одновременной обработки заявок от одного пользователя
+# Объект для блокировки одновременной обработки заявок от одного пользователя
 user_submission_locks = defaultdict(asyncio.Lock)
 
 REQUESTS_FILE = "requests.json"
@@ -50,15 +50,13 @@ def load_requests() -> Dict[str, dict]:
         with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
             txt = f.read().strip()
             data = json.loads(txt) if txt else {}
-    except json.JSONDecodeError:
-        print(f"[WARN] {REQUESTS_FILE} поврежден, создаем новый.")
+    except (json.JSONDecodeError, IOError):
+        print(f"[WARN] {REQUESTS_FILE} поврежден или не читается, создаем новый.")
         data = {}
 
-    # автоочистка старше 3 дней (по started_at)
     now = _now()
     changed = False
     for uid, rec in list(data.items()):
-        # Проверяем, что заявка не "вечная" (т.е. у нее есть дата начала)
         if rec.get("started_at"):
             started = rec.get("started_at")
             try:
@@ -66,27 +64,24 @@ def load_requests() -> Dict[str, dict]:
                     del data[uid]
                     changed = True
             except (ValueError, TypeError):
-                # Удаляем записи с некорректной датой
                 del data[uid]
                 changed = True
     if changed:
         save_requests(data)
     return data
 
-
 def save_requests(data: Dict[str, dict]) -> None:
-    with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        print(f"[ERROR] Не удалось сохранить {REQUESTS_FILE}: {e}")
 
 def update_user_lang(user_id: str, lang: str) -> List[str]:
     data = load_requests()
     rec = data.get(user_id) or {
-        "full_name": "",
-        "username": "",
-        "langs": [],
-        "started_at": None,
-        "submitted": False,
-        "has_seen_instructions": False, # [ИЗМЕНЕНО] Поле для запоминания
+        "full_name": "", "username": "", "langs": [],
+        "started_at": None, "submitted": False, "has_seen_instructions": False,
     }
     if lang and lang not in rec["langs"]:
         rec["langs"].append(lang)
@@ -97,17 +92,11 @@ def update_user_lang(user_id: str, lang: str) -> List[str]:
 def start_request(user, langs: List[str]) -> None:
     data = load_requests()
     user_id_str = str(user.id)
-    # [ИЗМЕНЕНО] Сохраняем флаг, если он уже был, чтобы не показывать задержку повторно
     existing_record = data.get(user_id_str, {})
     has_seen = existing_record.get("has_seen_instructions", False)
-
     data[user_id_str] = {
-        "full_name": user.full_name,
-        "username": user.username or "",
-        "langs": langs,
-        "started_at": _now().isoformat(),
-        "submitted": False,
-        "has_seen_instructions": has_seen,
+        "full_name": user.full_name, "username": user.username or "", "langs": langs,
+        "started_at": _now().isoformat(), "submitted": False, "has_seen_instructions": has_seen,
     }
     save_requests(data)
 
@@ -118,36 +107,28 @@ def mark_submitted(user_id: str) -> None:
         save_requests(data)
 
 def can_start_new_request(user_id: str) -> bool:
-    """Можно ли начать новый процесс (клик по способу оплаты)."""
     data = load_requests()
     rec = data.get(user_id)
-    if not rec:
-        return True
-    # Если заявка есть, но она не была отправлена, разрешаем начать заново
-    if not rec.get("submitted"):
-        return True
-    if not rec.get("started_at"):
-        return True
-    started = datetime.fromisoformat(rec["started_at"])
-    return _now() - started > timedelta(days=3)
-
+    return not rec or not rec.get("submitted", False)
 
 def has_active_request(user_id: str) -> bool:
-    """Можно ли сейчас прислать СВОЁ ЕДИНСТВЕННОЕ сообщение-заявку."""
     data = load_requests()
     rec = data.get(user_id)
-    if not rec or not rec.get("started_at"):
+    if not rec or not rec.get("started_at") or rec.get("submitted"):
         return False
-    if rec.get("submitted"):
+    try:
+        started = datetime.fromisoformat(rec["started_at"])
+        return _now() - started <= timedelta(days=3)
+    except (ValueError, TypeError):
         return False
-    started = datetime.fromisoformat(rec["started_at"])
-    return _now() - started <= timedelta(days=3)
 
 # ===================== CONFIG (цена) =====================
 def load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError): pass
     return {"price": "9$"}
 
 def save_config(config: dict) -> None:
@@ -156,10 +137,7 @@ def save_config(config: dict) -> None:
 
 # ===================== HELPERS =====================
 async def ensure_private_and_autoleave(message: Message) -> bool:
-    """
-    Возвращает True, если это ЛС. Если группа/канал — бот ливает (если это не ADMIN_CHAT_ID) и возвращает False.
-    """
-    if message.chat.type in ("group", "supergroup", "channel"):
+    if message.chat.type != "private":
         if message.chat.id != ADMIN_CHAT_ID:
             try:
                 await bot.leave_chat(message.chat.id)
@@ -176,7 +154,7 @@ def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
 
 # ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
 class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, wait: float = 1.0): # [ИЗМЕНЕНО] Таймер увеличен до 1 секунды
+    def __init__(self, wait: float = 1.0): # Таймер в 1 секунду
         super().__init__()
         self.wait = wait
         self._buffer: Dict[str, List[Message]] = defaultdict(list)
@@ -196,23 +174,19 @@ class AlbumMiddleware(BaseMiddleware):
             self._buffer[group_id].append(event)
             await asyncio.sleep(self.wait)
             messages = self._buffer.pop(group_id, [])
-            if not messages:
-                return
+            if not messages: return
 
             messages.sort(key=lambda m: m.message_id)
             data["album"] = messages
             return await handler(messages[0], data)
 
-dp.message.middleware(AlbumMiddleware())
+dp.message.middleware(AlbumMiddleware(wait=1.0))
 
 # ===================== HANDLERS =====================
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
-    if not await ensure_private_and_autoleave(message):
-        return
-
+    if not await ensure_private_and_autoleave(message): return
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-
     price = load_config()["price"]
     caption = (
         "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
@@ -220,17 +194,13 @@ async def send_welcome(message: Message):
         "Gene Premium Ultimate выдается навсегда.\n"
         "(Нажмите на товар, чтобы узнать подробности)"
     )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
-            [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
-        ]
-    )
-
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
+    ])
     if os.path.exists(WELCOME_IMAGE):
         try:
-            photo = FSInputFile(WELCOME_IMAGE)
-            await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+            await message.answer_photo(photo=FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=keyboard)
         except Exception as e:
             print(f"[WARN] Не удалось отправить локальную картинку: {e}")
             await message.answer(caption, reply_markup=keyboard)
@@ -239,51 +209,38 @@ async def send_welcome(message: Message):
 
 @dp.message(Command("setprice"))
 async def set_price(message: Message):
-    if message.chat.id != ADMIN_CHAT_ID or message.from_user.id != MAIN_ADMIN_ID:
-        return
-
+    if message.chat.id != ADMIN_CHAT_ID or message.from_user.id != MAIN_ADMIN_ID: return
     args = message.text.split(maxsplit=1)
     if len(args) < 2 or not args[1].strip():
         await message.answer("Использование: /setprice 15$")
         return
-
     new_price = args[1].strip()
-    cfg = load_config()
-    cfg["price"] = new_price
-    save_config(cfg)
+    cfg = load_config(); cfg["price"] = new_price; save_config(cfg)
     await message.answer(f"✅ Цена изменена на {new_price}")
 
-# ---- Кнопки в ЛС ----
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
-    if callback.message.chat.type != "private": return
     await callback.answer()
+    if callback.message.chat.type != "private": return
     price = load_config()["price"]
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Описание", url="https://t.me/GenePremium/6")],
-            [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
-            [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
-            [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Описание", url="https://t.me/GenePremium/6")],
+        [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
+    ])
     await callback.message.answer(f"Вы выбрали Premium за {price}\n\nВыберите способ оплаты:", reply_markup=keyboard)
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
 async def ask_screenshots(callback: CallbackQuery):
-    if callback.message.chat.type != "private": return
     await callback.answer()
-
-    user = callback.from_user
-    user_id_str = str(user.id)
-    
+    if callback.message.chat.type != "private": return
+    user, user_id_str = callback.from_user, str(callback.from_user.id)
     if not can_start_new_request(user_id_str):
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
-
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
-    start_request(user, langs) # Создаем или обновляем запись о начале заявки
-
+    start_request(user, langs)
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
@@ -293,117 +250,108 @@ async def ask_screenshots(callback: CallbackQuery):
         "А также (по желанию) фото прошитого 4G модема.\n\n"
         "⏳ Срок одобрения заявки ~3 дня."
     )
-
     data = load_requests()
     user_record = data.get(user_id_str, {})
-    has_seen = user_record.get("has_seen_instructions", False)
-
-    if not has_seen:
+    if not user_record.get("has_seen_instructions", False):
         preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
         await asyncio.sleep(random.randint(4234, 10110) / 1000)
         await preparing_msg.edit_text(instruction)
-        
         if user_id_str in data:
             data[user_id_str]["has_seen_instructions"] = True
             save_requests(data)
     else:
         await callback.message.answer(instruction)
 
-
-# ---- Кнопки в админ-чате ----
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
+    await callback.answer("Заявка отклонена и удалена ❌")
     if callback.message.chat.id != ADMIN_CHAT_ID: return
     if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
-        await callback.answer("❌ Нет прав")
         return
-
     user_id = callback.data.split("_", 1)[1]
-    
     data = load_requests()
     if user_id in data:
         del data[user_id]
         save_requests(data)
-
-    await callback.answer("Заявка отклонена и удалена ❌")
     try:
-        await bot.send_message(user_id, "❌ Ваша заявка на Gene Premium отклонена. Вы можете попробовать подать её снова, выбрав способ оплаты в /start.")
+        await bot.send_message(user_id, "❌ Ваша заявка отклонена. Вы можете попробовать подать её снова, выбрав способ оплаты в /start.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
-    
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    except Exception: pass
 
-# ===================== ПРИЁМ ЗАЯВОК =====================
+# ===================== ПРИЁМ ЗАЯВОК (ПОЛНОСТЬЮ ПЕРЕПИСАН) =====================
 @dp.message()
 async def handle_submission(message: Message, album: Optional[List[Message]] = None):
     if not await ensure_private_and_autoleave(message): return
-
-    user = message.from_user
-    user_id = str(user.id)
-
-    # [ИЗМЕНЕНО] Блокируем обработку, чтобы избежать "гонки состояний"
+    user, user_id = message.from_user, str(message.from_user.id)
+    
+    # Блокировка для предотвращения "гонки состояний" (зуй/быыыы)
     async with user_submission_locks[user_id]:
-        # Повторно проверяем статус ВНУТРИ блокировки, чтобы второе сообщение не прошло
+        # Повторная проверка статуса ВНУТРИ блокировки
         if not has_active_request(user_id):
             return
-
+        
         langs = update_user_lang(user_id, user.language_code or "unknown")
         header = make_header(user, langs)
-
         admin_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]]
         )
-
+        
+        submission_sent = False
         try:
             # ===== АЛЬБОМ =====
             if album:
-                original_caption = album[0].caption or ""
-                full_caption = f"{header}\n\n{original_caption}".strip()
-                
-                photo_video_builder = MediaGroupBuilder()
-                doc_builder = MediaGroupBuilder()
-
+                pv_builder, doc_builder = MediaGroupBuilder(), MediaGroupBuilder()
+                # Собираем медиа БЕЗ подписи
                 for m in album:
-                    if m.photo: photo_video_builder.add_photo(m.photo[-1].file_id)
-                    elif m.video: photo_video_builder.add_video(m.video.file_id)
+                    if m.photo: pv_builder.add_photo(m.photo[-1].file_id)
+                    elif m.video: pv_builder.add_video(m.video.file_id)
                     elif m.document: doc_builder.add_document(m.document.file_id)
                 
-                caption_sent = False
-                media_sent = False
-
-                pv_built = photo_video_builder.build()
+                pv_built = pv_builder.build()
                 if pv_built:
-                    pv_built[0].caption = full_caption
                     await bot.send_media_group(ADMIN_CHAT_ID, media=pv_built)
-                    caption_sent = True
-                    media_sent = True
-
+                    submission_sent = True
+                
                 doc_built = doc_builder.build()
                 if doc_built:
-                    if not caption_sent:
-                        doc_built[0].caption = full_caption
                     await bot.send_media_group(ADMIN_CHAT_ID, media=doc_built)
-                    media_sent = True
+                    submission_sent = True
                 
-                if media_sent:
-                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
-                
-            # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
-            else:
-                cap = f"{header}\n\n{message.caption or ''}".strip()
-                if message.photo: await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=cap, reply_markup=admin_keyboard)
-                elif message.document: await bot.send_document(ADMIN_CHAT_ID, document=message.document.file_id, caption=cap, reply_markup=admin_keyboard)
-                elif message.video: await bot.send_video(ADMIN_CHAT_ID, video=message.video.file_id, caption=cap, reply_markup=admin_keyboard)
-                elif message.text: await bot.send_message(ADMIN_CHAT_ID, f"{header}\n\n{message.text}", reply_markup=admin_keyboard)
-                else:
-                    await bot.send_message(ADMIN_CHAT_ID, f"{header}\n[Неподдерживаемый тип сообщения]", reply_markup=admin_keyboard)
+                if submission_sent:
+                    # Отправляем заголовок и кнопки отдельным сообщением
+                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+            
+            # ===== ОДИНОЧНОЕ МЕДИА (Фото, Видео, Документ) =====
+            elif message.photo or message.video or message.document:
+                # Копируем сообщение (сохраняет подпись, убирает автора)
+                await bot.copy_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    from_chat_id=user_id,
+                    message_id=message.message_id
+                )
+                # Отправляем заголовок и кнопки отдельным сообщением
+                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                submission_sent = True
+            
+            # ===== ОДИНОЧНОЕ ТЕКСТОВОЕ СООБЩЕНИЕ =====
+            elif message.text:
+                # Отправляем текст пользователя
+                await bot.send_message(ADMIN_CHAT_ID, text=message.text)
+                # Отправляем заголовок и кнопки отдельным сообщением
+                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                submission_sent = True
 
-            # Общие действия после любой успешной отправки
-            await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-            mark_submitted(user_id)
+            # ===== ДРУГИЕ ТИПЫ СООБЩЕНИЙ (стикеры и т.д.) ИГНОРИРУЕМ =====
+            else:
+                return # Молча игнорируем стикеры, аудио и т.д.
+
+            # Общие действия, если что-то было отправлено
+            if submission_sent:
+                await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
+                mark_submitted(user_id)
 
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
