@@ -64,10 +64,16 @@ ADMINS = _parse_int_list("ADMINS")
 ADMIN_THREAD_IDS = _parse_int_list("ADMIN_THREAD_ID")      # optional topic ids for submissions (per admin chat)
 ADMIN_LOG_THREAD_IDS = _parse_int_list("ADMIN_LOG_THREAD_ID")  # optional topic ids for logs (per admin chat)
 
+# ADMIN_THREAD_NAMES: names separated by "||" (double pipe) to allow commas inside names.
+ADMIN_THREAD_NAMES_RAW = os.getenv("ADMIN_THREAD_NAMES", "").strip()
+ADMIN_THREAD_NAMES: List[str] = []
+if ADMIN_THREAD_NAMES_RAW:
+    ADMIN_THREAD_NAMES = [p.strip() for p in ADMIN_THREAD_NAMES_RAW.split("||")]
+
 # Combined admin sets for permission checks
 ALL_ADMINS_SET = set(ADMINS) | set(MAIN_ADMIN_IDS)
 
-print(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+print(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
 
 # ===================== Bot init =====================
 API_TOKEN = os.getenv("BOT_TOKEN2")
@@ -85,6 +91,7 @@ CONFIG_FILE = "config.json"
 WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
 BANNED_FILE = "banned.json"
 ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg" -> user_id
+ADMIN_TOPICS_FILE = "admin_topics.json"  # сохраняет маппинг chat_id -> thread_id (созданные темы)
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
@@ -92,6 +99,9 @@ collecting_tasks: Dict[str, asyncio.Task] = {}
 
 # mapping admin chat+message -> user_id (ключ: "chat:msgid")
 admin_message_to_user: Dict[str, int] = {}
+
+# in-memory map of created topics (chat_id -> thread_id)
+admin_topics_map: Dict[str, int] = {}
 
 # ===================== STORAGE & MAPS & BANS =====================
 
@@ -180,6 +190,25 @@ def save_admin_map(m: Dict[str, int]) -> None:
         print(f"[WARN] Не удалось сохранить {ADMIN_MAP_FILE}: {e}")
 
 
+def load_admin_topics() -> Dict[str, int]:
+    if not os.path.exists(ADMIN_TOPICS_FILE):
+        return {}
+    try:
+        with open(ADMIN_TOPICS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            return {str(k): int(v) for k, v in (raw.items() if isinstance(raw, dict) else {})}
+    except Exception:
+        return {}
+
+
+def save_admin_topics(m: Dict[str, int]) -> None:
+    try:
+        with open(ADMIN_TOPICS_FILE, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить {ADMIN_TOPICS_FILE}: {e}")
+
+
 def _admin_map_key(chat_id: int, message_id: int) -> str:
     return f"{chat_id}:{message_id}"
 
@@ -206,6 +235,11 @@ try:
     admin_message_to_user = load_admin_map()
 except Exception:
     admin_message_to_user = {}
+
+try:
+    admin_topics_map = load_admin_topics()
+except Exception:
+    admin_topics_map = {}
 
 # ===================== REQUESTS / LANGS =====================
 
@@ -333,7 +367,7 @@ async def _try_edit_original_message(chat_id: int, message_id: int, text: str, r
     return False
 
 
-# ===================== HELP: thread selection =====================
+# ===================== HELP: thread selection & creation =====================
 
 def get_thread_for_chat(chat_id: int) -> Optional[int]:
     try:
@@ -355,20 +389,66 @@ def get_log_thread_for_chat(chat_id: int) -> Optional[int]:
     return None
 
 
+async def ensure_or_create_topic_for_chat(chat_id: int) -> Optional[int]:
+    """
+    Если для chat_id есть сохранённый thread_id — вернуть его.
+    Иначе, если в ADMIN_THREAD_IDS задано id — вернуть его.
+    Иначе, если в ADMIN_THREAD_NAMES задано имя для этого chat (по индексу) — попытаться создать тему.
+    Сохранить в admin_topics_map и вернуть id; иначе вернуть None.
+    """
+    key = str(chat_id)
+    if key in admin_topics_map:
+        try:
+            return int(admin_topics_map[key])
+        except Exception:
+            pass
+
+    # если в env заранее указан ID — вернуть его
+    try:
+        idx = ADMIN_CHAT_IDS.index(chat_id)
+    except ValueError:
+        idx = None
+
+    if idx is not None and idx < len(ADMIN_THREAD_IDS) and ADMIN_THREAD_IDS[idx]:
+        return ADMIN_THREAD_IDS[idx]
+
+    # попытка создать тему по имени (если задано имя)
+    if idx is not None and idx < len(ADMIN_THREAD_NAMES):
+        name = ADMIN_THREAD_NAMES[idx].strip()
+        if name:
+            try:
+                # create_forum_topic возвращает Message с message_thread_id
+                res_msg: Message = await bot.create_forum_topic(chat_id=chat_id, name=name)
+                thread_id = getattr(res_msg, "message_thread_id", None)
+                if not thread_id:
+                    # try dict access if aiogram version returns raw
+                    try:
+                        j = res_msg.json()
+                        thread_id = j.get("message_thread_id")
+                    except Exception:
+                        thread_id = None
+                if thread_id:
+                    admin_topics_map[key] = int(thread_id)
+                    save_admin_topics(admin_topics_map)
+                    print(f"[INFO] Создана тема '{name}' в чате {chat_id} -> thread {thread_id}")
+                    return int(thread_id)
+            except Exception as e:
+                print(f"[WARN] Не удалось создать тему '{name}' в чате {chat_id}: {e}")
+                return None
+    return None
+
+
 # ===================== LOGGING USER ACTIONS =====================
 
 async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict, object], action: str) -> None:
     """
     Логирует событие action для пользователя во все admin_chat'ы, в соответствующие log topics (если заданы).
-    user_obj может быть Message или CallbackQuery или объект with .from_user
     """
-    # Получим User-like объект
     if isinstance(user_obj, CallbackQuery):
         user = user_obj.from_user
     elif isinstance(user_obj, Message):
         user = user_obj.from_user
     else:
-        # попытка взять .from_user или .user
         user = getattr(user_obj, "from_user", None) or getattr(user_obj, "user", None)
 
     if not user:
@@ -376,7 +456,6 @@ async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict,
 
     uid = user.id
     uid_str = str(uid)
-    # Возьмём языки из requests (если есть)
     data = load_requests()
     user_rec = data.get(uid_str, {})
     langs = user_rec.get("langs", [])
@@ -392,6 +471,7 @@ async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict,
 
     # Отправляем в каждый admin chat (в thread если задан)
     for admin_chat in ADMIN_CHAT_IDS:
+        # пытаемся использовать заранее настроенную log-thread (если есть)
         thread_id = get_log_thread_for_chat(admin_chat)
         try:
             if thread_id is not None:
@@ -793,9 +873,10 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         )
 
         try:
-            # Для каждого admin chat отправляем копии и шапку (в topic, если задан)
+            # Для каждого admin chat отправляем копии и шапку (в topic, если задан или можно создать)
             for admin_chat in ADMIN_CHAT_IDS:
-                thread_id = get_thread_for_chat(admin_chat)  # может быть None
+                # NEW: ensure or create thread for submissions (if ADMIN_THREAD_NAMES provided)
+                thread_id = await ensure_or_create_topic_for_chat(admin_chat)
 
                 if isinstance(messages, list):
                     album_msgs: List[Message] = sorted(messages, key=lambda m: m.message_id)
@@ -960,7 +1041,13 @@ async def leave_any_group(message: Message):
 
 # ===================== MAIN =====================
 async def main():
-    print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+    print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+    # Попытка заранее создать темы, которые указаны в ADMIN_THREAD_NAMES и ещё не сохранены
+    for admin_chat in ADMIN_CHAT_IDS:
+        try:
+            await ensure_or_create_topic_for_chat(admin_chat)
+        except Exception:
+            pass
     await dp.start_polling(bot)
 
 
