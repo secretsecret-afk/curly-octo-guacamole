@@ -4,7 +4,7 @@ import asyncio
 import random
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
@@ -166,7 +166,7 @@ class AlbumMiddleware(BaseMiddleware):
 
     async def __call__(
         self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        handler: Callable[[Union[Message, List[Message]], Dict[str, Any]], Awaitable[Any]],
         event: Message,
         data: Dict[str, Any]
     ) -> Any:
@@ -183,7 +183,8 @@ class AlbumMiddleware(BaseMiddleware):
 
             messages.sort(key=lambda m: m.message_id)
             data["album"] = messages
-            return await handler(messages[0], data)
+            # Передаем весь список сообщений
+            return await handler(messages, data)
 
 dp.message.middleware(AlbumMiddleware(wait=1.0))
 
@@ -290,9 +291,15 @@ async def reject_request(callback: CallbackQuery):
 # ===================== ПРИЁМ ЗАЯВОК (с пересылкой альбомов) =====================
 
 @dp.message()
-async def handle_submission(message: Message, album: Optional[List[Message]] = None):
-    if not await ensure_private_and_autoleave(message): return
-    user, user_id = message.from_user, str(message.from_user.id)
+async def handle_submission(messages: Union[Message, List[Message]], album: Optional[List[Message]] = None):
+    # messages может быть как одиночным сообщением, так и списком (альбом)
+    if isinstance(messages, list):
+        first_message = messages[0]
+    else:
+        first_message = messages
+
+    if not await ensure_private_and_autoleave(first_message): return
+    user, user_id = first_message.from_user, str(first_message.from_user.id)
 
     async with user_submission_locks[user_id]:
         if not has_active_request(user_id):
@@ -307,12 +314,12 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
         submission_sent = False
         try:
             # ===== АЛЬБОМ =====
-            if album:
-                for m in album:
+            if isinstance(messages, list):
+                for m in messages:
                     try:
                         await bot.forward_message(
                             chat_id=ADMIN_CHAT_ID,
-                            from_chat_id=user_id,
+                            from_chat_id=m.chat.id,
                             message_id=m.message_id
                         )
                         submission_sent = True
@@ -322,37 +329,26 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
                 if submission_sent:
                     await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
 
-            # ===== ОДИНОЧНОЕ МЕДИА =====
-            elif message.photo or message.video or message.document:
-                await bot.forward_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    from_chat_id=user_id,
-                    message_id=message.message_id
-                )
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
-
-            # ===== ОДИНОЧНЫЙ ТЕКСТ =====
-            elif message.text:
-                await bot.forward_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    from_chat_id=user_id,
-                    message_id=message.message_id
-                )
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
-
-            # ===== ДРУГИЕ ТИПЫ =====
+            # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
             else:
-                return
+                if messages.photo or messages.video or messages.document or messages.text:
+                    await bot.forward_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        from_chat_id=messages.chat.id,
+                        message_id=messages.message_id
+                    )
+                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                    submission_sent = True
+                else:
+                    return
 
             if submission_sent:
-                await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
+                await first_message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
                 mark_submitted(user_id)
 
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-            await message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
+            await first_message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
 
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 
