@@ -92,6 +92,7 @@ WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
 BANNED_FILE = "banned.json"
 ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg" -> user_id
 ADMIN_TOPICS_FILE = "admin_topics.json"  # сохраняет маппинг chat_id -> thread_id (созданные темы)
+REJECTED_FILE = "rejected.json"  # сохраняет пользователей, которым отклонили заявку
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
@@ -102,6 +103,9 @@ admin_message_to_user: Dict[str, int] = {}
 
 # in-memory map of created topics (chat_id -> thread_id)
 admin_topics_map: Dict[str, int] = {}
+
+# in-memory rejected users set (loaded from REJECTED_FILE)
+rejected_users: set = set()
 
 # ===================== STORAGE & MAPS & BANS =====================
 
@@ -209,6 +213,46 @@ def save_admin_topics(m: Dict[str, int]) -> None:
         print(f"[WARN] Не удалось сохранить {ADMIN_TOPICS_FILE}: {e}")
 
 
+def load_rejected() -> set:
+    if not os.path.exists(REJECTED_FILE):
+        return set()
+    try:
+        with open(REJECTED_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            return set(int(x) for x in raw if x is not None)
+    except Exception:
+        return set()
+
+
+def save_rejected(s: set) -> None:
+    try:
+        with open(REJECTED_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(s), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить {REJECTED_FILE}: {e}")
+
+
+def add_rejected(uid: int) -> None:
+    global rejected_users
+    rejected_users.add(int(uid))
+    save_rejected(rejected_users)
+
+
+def remove_rejected(uid: int) -> None:
+    global rejected_users
+    try:
+        rejected_users.discard(int(uid))
+        save_rejected(rejected_users)
+    except Exception:
+        pass
+
+
+def clear_all_rejected() -> None:
+    global rejected_users
+    rejected_users.clear()
+    save_rejected(rejected_users)
+
+
 def _admin_map_key(chat_id: int, message_id: int) -> str:
     return f"{chat_id}:{message_id}"
 
@@ -240,6 +284,11 @@ try:
     admin_topics_map = load_admin_topics()
 except Exception:
     admin_topics_map = {}
+
+try:
+    rejected_users = load_rejected()
+except Exception:
+    rejected_users = set()
 
 # ===================== REQUESTS / LANGS =====================
 
@@ -642,6 +691,15 @@ async def ask_screenshots(callback: CallbackQuery):
 
     data = load_requests()
     user_record = data.get(user_id_str, {})
+    # Если пользователь ранее отклонён (в requests.json или в rejected.json) — НЕ показываем "Подготавливаем..." и сразу отправляем инструкцию.
+    if user_record.get("rejected", False) or int(user_id_str) in rejected_users:
+        await callback.message.answer(instruction)
+        # отметим, что он видел инструкции
+        if user_id_str in data:
+            data[user_id_str]["has_seen_instructions"] = True
+            save_requests(data)
+        return
+
     if not user_record.get("has_seen_instructions", False):
         preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
         await asyncio.sleep(random.randint(4234, 10110) / 1000)
@@ -667,9 +725,24 @@ async def reject_request(callback: CallbackQuery):
         return
     user_id = callback.data.split("_", 1)[1]
     data = load_requests()
-    if user_id in data:
-        del data[user_id]
-        save_requests(data)
+    # Вместо удаления — помечаем как отклонённую, чтобы при следующем заходе не показывать "Подготавливаем..."
+    rec = data.get(user_id, {})
+    rec["rejected"] = True
+    rec["submitted"] = False
+    rec["started_at"] = None
+    rec["has_seen_instructions"] = False
+    # сохраняем full_name/username если их нет (необязательно)
+    rec.setdefault("full_name", rec.get("full_name", ""))
+    rec.setdefault("username", rec.get("username", ""))
+    rec.setdefault("langs", rec.get("langs", []))
+    data[user_id] = rec
+    save_requests(data)
+
+    try:
+        add_rejected(int(user_id))
+    except Exception:
+        pass
+
     try:
         await bot.send_message(user_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
     except Exception as e:
@@ -712,6 +785,11 @@ async def ban_request(callback: CallbackQuery):
                 pass
     except Exception as e:
         print(f"[WARN] Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
+
+    try:
+        add_rejected(uid)
+    except Exception:
+        pass
 
     try:
         await bot.send_message(uid, "🔒 Вы были заблокированы.")
@@ -799,6 +877,11 @@ async def cmd_ban(message: Message):
                 continue
     except Exception as e:
         print(f"[WARN] Ошибка при очистке админских сообщений для {target_id}: {e}")
+
+    try:
+        add_rejected(int(target_id))
+    except Exception:
+        pass
 
     # уведомляем админа и пользователя
     await message.reply(f"🔒 Пользователь {target_id} заблокирован и его заявка закрыта.")
@@ -911,6 +994,53 @@ async def cmd_banned(message: Message):
         return
     text = "Заблокированные пользователи:\n" + "\n".join([str(x) for x in banned])
     await message.reply(text)
+
+
+# ===================== NEW: /clear_rejected command =====================
+@dp.message(Command("clear_rejected"))
+async def cmd_clear_rejected(message: Message):
+    """
+    /clear_rejected             -> очистить всех rejected
+    /clear_rejected <user_id>   -> удалить одного пользователя из rejected
+    Доступно только для админов.
+    """
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, f"Команда /clear_rejected ({message.text})")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        # очистка конкретного
+        try:
+            uid = int(parts[1].strip())
+        except ValueError:
+            await message.reply("Неверный id. Использование: /clear_rejected <user_id> или /clear_rejected")
+            return
+        remove_rejected(uid)
+        # также удаляем флаг rejected из requests.json если он там есть
+        data = load_requests()
+        rec = data.get(str(uid))
+        if rec and rec.get("rejected"):
+            rec.pop("rejected", None)
+            data[str(uid)] = rec
+            save_requests(data)
+        await message.reply(f"✅ Пользователь {uid} удалён из списка отклонённых.")
+    else:
+        # очистка всех
+        clear_all_rejected()
+        # чистим флаги в requests.json
+        data = load_requests()
+        changed = False
+        for k, rec in list(data.items()):
+            if rec.get("rejected"):
+                rec.pop("rejected", None)
+                data[k] = rec
+                changed = True
+        if changed:
+            save_requests(data)
+        await message.reply("✅ Список отклонённых пользователей очищен.")
 
 
 # ===================== ПРИЁМ ЗАЯВОК (с копированием) =====================
@@ -1043,7 +1173,11 @@ async def collect_user_messages(message: Message):
     if not has_active_request(user_id_str) or load_requests().get(user_id_str, {}).get("submitted"):
         return
 
+    # Добавляем сообщение в буфер; ограничиваем до 4 сообщений (чтобы кнопки у заявки не пропадали)
     submission_buffers[user_id_str].append(message)
+    if len(submission_buffers[user_id_str]) > 4:
+        # оставляем только 4 последних сообщений
+        submission_buffers[user_id_str] = submission_buffers[user_id_str][-4:]
 
     existing = collecting_tasks.get(user_id_str)
     if existing and not existing.done():
@@ -1133,6 +1267,10 @@ async def main():
         except Exception:
             pass
     await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
