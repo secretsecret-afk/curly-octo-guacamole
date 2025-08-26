@@ -414,7 +414,7 @@ async def send_welcome(message: Message):
     await log_user_action(message, "/start")
 
     if is_banned(message.from_user.id):
-        await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+        await message.answer("🔒 Вы заблокированы.")
         return
 
     if not await ensure_private_and_autoleave(message):
@@ -427,8 +427,8 @@ async def send_welcome(message: Message):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f" 🥳 Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text=" 🪄 Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
     if os.path.exists(WELCOME_IMAGE):
         try:
@@ -469,15 +469,15 @@ async def process_premium(callback: CallbackQuery):
     await log_user_action(callback, "Нажал кнопку: Premium")
 
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокены.", show_alert=True)
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
         return
 
     # построим клавиатуру оплаты
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Картой", callback_data="pay_card")],
-        [InlineKeyboardButton(text="🪙 Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
         [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
+        [InlineKeyboardButton(text="🏠", callback_data="home")],
     ])
 
     orig_chat_id = callback.message.chat.id
@@ -502,7 +502,7 @@ async def go_home(callback: CallbackQuery):
     await log_user_action(callback, "Нажал кнопку: Домой")
 
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокены.", show_alert=True)
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
         return
 
     price = load_config()["price"]
@@ -513,8 +513,8 @@ async def go_home(callback: CallbackQuery):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f" 🥳 Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text=" 🪄 Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f" 🫣 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text=" 🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
 
     orig_chat_id = callback.message.chat.id
@@ -527,7 +527,7 @@ async def go_home(callback: CallbackQuery):
         await callback.answer()
         return
 
-    await callback.answer("⚠️ Не удалось обновить приветствие. Попробуйте ещё раз.", show_alert=True)
+    await callback.answer("⚠️Попробуйте ещё раз.", show_alert=True)
 
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
@@ -538,7 +538,7 @@ async def ask_screenshots(callback: CallbackQuery):
     await log_user_action(callback, f"Выбрал способ оплаты: {callback.data}")
 
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокены.", show_alert=True)
+        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
         return
 
     await callback.answer()
@@ -553,7 +553,7 @@ async def ask_screenshots(callback: CallbackQuery):
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
-        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
+        "Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
         "• Gene's Land чат\n\n"
         "А также (по желанию) фото прошитого 4G модема.\n\n"
@@ -634,7 +634,7 @@ async def ban_request(callback: CallbackQuery):
         print(f"[WARN] Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
 
     try:
-        await bot.send_message(uid, "🔒 Вы были заблокированы. Связаться с поддержкой нельзя.")
+        await bot.send_message(uid, "🔒 Вы были заблокированы.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {uid}: {e}")
 
@@ -685,7 +685,7 @@ async def cmd_unban(message: Message):
 
     await message.reply(f"✅ Пользователь {target_id} разблокирован.")
     try:
-        await bot.send_message(chat_id=target_id, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
+        await bot.send_message(chat_id=target_id, text="🔓 Вас разблокировали.")
     except Exception:
         pass
 
@@ -722,7 +722,7 @@ async def unban_request(callback: CallbackQuery):
 
     await callback.message.answer(f"✅ Пользователь {uid} разблокирован.")
     try:
-        await bot.send_message(chat_id=uid, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
+        await bot.send_message(chat_id=uid, text="🔓 Вас разблокировали.")
     except Exception:
         pass
 
@@ -769,7 +769,7 @@ async def handle_submission(messages: Union[Message, List[Message]]):
             except Exception:
                 pass
         try:
-            await bot.send_message(chat_id=user.id, text="🔒 Вы заблокированы. Ваша заявка удалена.")
+            await bot.send_message(chat_id=user.id, text="🔒 Вы заблокированы.")
         except Exception:
             pass
         return
@@ -841,10 +841,10 @@ async def handle_submission(messages: Union[Message, List[Message]]):
 
         except TelegramBadRequest as e:
             print(f"[BAD_REQUEST] {e!r}")
-            await first_message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз (или без подписи).")
+            await first_message.answer("⚠️ Не удалось отправить заявку. Попробуйте ещё раз .")
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-            await first_message.answer("⚠️ Не удалось отправить администраторам.\nПопробуйте ещё раз позже.")
+            await first_message.answer("⚠️ Не удалось отправить заявку.\nПопробуйте ещё раз позже.")
 
 
 # Новый обработчик: собирает сообщения от пользователя в буфер и запускает задачу-коллектор
@@ -865,7 +865,7 @@ async def collect_user_messages(message: Message):
             except Exception:
                 pass
         try:
-            await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
+            await message.answer("🔒 Вы заблокированы.")
         except Exception:
             pass
         return
