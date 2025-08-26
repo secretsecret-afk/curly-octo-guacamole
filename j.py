@@ -8,13 +8,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties  # <<< 1. ADD THIS IMPORT
+from aiogram.enums import ParseMode
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton,
     FSInputFile
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
-from aiogram.enums import ParseMode
+
 
 # ===================== ENV =====================
 
@@ -29,7 +31,8 @@ if not API_TOKEN:
 if ADMIN_CHAT_ID == 0:
     print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат. Проверь .env.prem")
 
-bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
+#  <<< 2. MODIFY THIS LINE
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # Объект для блокировки одновременной обработки заявок от одного пользователя
