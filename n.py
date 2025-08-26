@@ -11,7 +11,8 @@ from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import (
     Message, CallbackQuery, ChatMemberUpdated,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaDocument
+    InputMediaPhoto, InputMediaDocument,
+    FSInputFile
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
 from aiogram.utils.media_group import MediaGroupBuilder
@@ -216,8 +217,9 @@ async def send_welcome(message: Message):
 
     if os.path.exists(WELCOME_IMAGE):
         try:
-            with open(WELCOME_IMAGE, "rb") as photo:
-                await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+            # ИСПРАВЛЕНО: Используем FSInputFile для локального файла
+            photo = FSInputFile(WELCOME_IMAGE)
+            await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
         except Exception as e:
             print(f"[WARN] Не удалось отправить локальную картинку: {e}")
             await message.answer(caption, reply_markup=keyboard)
