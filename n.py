@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import json
 import asyncio
@@ -41,7 +38,6 @@ ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 if not API_TOKEN:
     raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
 if ADMIN_CHAT_ID == 0:
-    # корректная строка с escape для новой строки
     print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат.\nПроверь .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -53,10 +49,14 @@ user_submission_locks = defaultdict(asyncio.Lock)
 REQUESTS_FILE = "requests.json"
 CONFIG_FILE = "config.json"
 WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
+BANNED_FILE = "banned.json"
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
 collecting_tasks: Dict[str, asyncio.Task] = {}
+
+# mapping admin chat message_id -> user_id (для reply из админ-чата)
+admin_message_to_user: Dict[int, int] = {}
 
 # ===================== STORAGE =====================
 
@@ -100,7 +100,39 @@ def save_requests(data: Dict[str, dict]) -> None:
         print(f"[ERROR] Не удалось сохранить {REQUESTS_FILE}: {e}")
 
 
+def load_banned() -> List[int]:
+    if not os.path.exists(BANNED_FILE):
+        return []
+    try:
+        with open(BANNED_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_banned(b: List[int]) -> None:
+    try:
+        with open(BANNED_FILE, "w", encoding="utf-8") as f:
+            json.dump(b, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить {BANNED_FILE}: {e}")
+
+
+def ban_user_by_id(uid: int) -> None:
+    b = load_banned()
+    if uid not in b:
+        b.append(uid)
+        save_banned(b)
+
+
+def is_banned(uid: int) -> bool:
+    return uid in load_banned()
+
+
 def update_user_lang(user_id: str, lang: str) -> List[str]:
+    """
+    Добавляет язык в список языков пользователя (если ещё нет) и сохраняет запись.
+    """
     data = load_requests()
     rec = data.get(user_id) or {
         "full_name": "",
@@ -141,6 +173,8 @@ def mark_submitted(user_id: str) -> None:
 
 
 def can_start_new_request(user_id: str) -> bool:
+    if is_banned(int(user_id)):
+        return False
     data = load_requests()
     rec = data.get(user_id)
     return not rec or not rec.get("submitted", False)
@@ -194,9 +228,11 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
 
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
+    # логируем язык при команде start
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
     if not await ensure_private_and_autoleave(message):
         return
-    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
     price = load_config()["price"]
     caption = (
         "Добро пожаловать! Я платёжный бот Gene's Land!\n\n"
@@ -205,8 +241,8 @@ async def send_welcome(message: Message):
         "(Нажмите на товар, чтобы узнать подробности)"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f" Premium - {price}", callback_data="premium")],
-        [InlineKeyboardButton(text=" Поддержка", url="https://t.me/genepremiumsupportbot")],
+        [InlineKeyboardButton(text=f"🫣 Premium - {price}", callback_data="premium")],
+        [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
     ])
     if os.path.exists(WELCOME_IMAGE):
         try:
@@ -220,6 +256,9 @@ async def send_welcome(message: Message):
 
 @dp.message(Command("setprice"))
 async def set_price(message: Message):
+    # логируем язык админа, если нужен
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
     if message.chat.id != ADMIN_CHAT_ID or message.from_user.id != MAIN_ADMIN_ID:
         return
     args = message.text.split(maxsplit=1)
@@ -235,15 +274,19 @@ async def set_price(message: Message):
 
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
+    # логируем язык на нажатие кнопки Premium
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
     await callback.answer()
     if callback.message.chat.type != "private":
         return
     # Build payment keyboard with emojis and Home button
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Картой", callback_data="pay_card")],
-        [InlineKeyboardButton(text="🪙 Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
         [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
+        [InlineKeyboardButton(text="🔒 Заблокировать (только админы)", callback_data="noop")],  # placeholder in user UI
+        [InlineKeyboardButton(text="🏠", callback_data="home")],
     ])
 
     # Instead of sending a new separate message with price, edit the original message/caption
@@ -259,6 +302,9 @@ async def process_premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "home")
 async def go_home(callback: CallbackQuery):
+    # логируем язык при возврате домой
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
     await callback.answer()
     if callback.message.chat.type != "private":
         return
@@ -301,6 +347,9 @@ async def go_home(callback: CallbackQuery):
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
 async def ask_screenshots(callback: CallbackQuery):
+    # логируем язык при выборе способа оплаты
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
     await callback.answer()
     if callback.message.chat.type != "private":
         return
@@ -313,7 +362,7 @@ async def ask_screenshots(callback: CallbackQuery):
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
-        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
+        "Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
         "• Gene's Land чат\n\n"
         "А также (по желанию) фото прошитого 4G модема.\n\n"
@@ -326,18 +375,20 @@ async def ask_screenshots(callback: CallbackQuery):
         preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
         await asyncio.sleep(random.randint(4234, 10110) / 1000)
         await preparing_msg.edit_text(instruction)
-        # Inform user that bot is now waiting for their messages
-        await callback.message.answer("🔔 Жду ваши сообщения — отправьте скриншоты/медиа.")
+        # NOTE: removed the '🔔 Жду ваши сообщения' message as requested
         if user_id_str in data:
             data[user_id_str]["has_seen_instructions"] = True
             save_requests(data)
     else:
         await callback.message.answer(instruction)
-        await callback.message.answer("🔔 Жду ваши сообщения — отправьте скриншоты/медиа.")
+        # NOTE: removed the '🔔 Жду ваши сообщения' message as requested
 
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
+    # логируем язык админа
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
     await callback.answer("Заявка отклонена и удалена ❌")
     if callback.message.chat.id != ADMIN_CHAT_ID:
         return
@@ -350,6 +401,35 @@ async def reject_request(callback: CallbackQuery):
         save_requests(data)
     try:
         await bot.send_message(user_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
+    except Exception as e:
+        print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def ban_request(callback: CallbackQuery):
+    # логируем язык админа
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
+    await callback.answer("Пользователь заблокирован 🔒")
+    if callback.message.chat.id != ADMIN_CHAT_ID:
+        return
+    if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
+        return
+    user_id = callback.data.split("_", 1)[1]
+    try:
+        ban_user_by_id(int(user_id))
+    except Exception as e:
+        print(f"[WARN] Не удалось заблокировать {user_id}: {e}")
+    data = load_requests()
+    if user_id in data:
+        del data[user_id]
+        save_requests(data)
+    try:
+        await bot.send_message(user_id, "🔒 Вы были заблокированы.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
     try:
@@ -378,11 +458,14 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         # Шапка для админов + клавиатура
         safe_full_name = escape(user.full_name or "(без имени)")
         safe_username = f"@{escape(user.username)}" if user.username else ""
-        safe_lang = escape(user.language_code or "неизвестно")
-        header = f"{safe_full_name} {safe_username}\nID: {user.id}\nЯзык: {safe_lang}"
+        data = load_requests()
+        langs = data.get(user_id_str, {}).get("langs", [user.language_code or "неизвестно"])
+        safe_langs = ", ".join([escape(x) for x in langs])
+        header = f"{safe_full_name} {safe_username}\nID: {user.id}\nЯзыки: {safe_langs}"
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]
+                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}"),
+                 InlineKeyboardButton(text="🔒 Заблокировать", callback_data=f"ban_{user.id}")],
             ]
         )
 
@@ -398,8 +481,11 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                     # Для альбомов: копируем все media (telegram сохранит порядок),
                     # затем отправляем шапку с кнопкой
                     for m in album_msgs:
-                        await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
-                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                        res = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
+                        # связываем скопированное сообщение с user_id
+                        admin_message_to_user[res.message_id] = int(user.id)
+                    header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                    admin_message_to_user[header_msg.message_id] = int(user.id)
 
                 else:
                     # Не альбом — собираем InputMedia и отправляем как media_group когда возможно
@@ -418,19 +504,24 @@ async def handle_submission(messages: Union[Message, List[Message]]):
                             media_group.append(InputMediaAudio(media=m.audio.file_id, caption=cap, parse_mode="HTML"))
                         else:
                             # если встретился тип, не поддерживаемый в альбомах — просто докинем отдельно
-                            await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
+                            res = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
+                            admin_message_to_user[res.message_id] = int(user.id)
                     if media_group:
-                        # отправляем группой
-                        await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media_group)
-                        # после группы — отправляем шапку с кнопкой
-                        await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                        sent = await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media_group)
+                        # sent — список сообщений, свяжем все с user_id
+                        for s in sent:
+                            admin_message_to_user[s.message_id] = int(user.id)
+                        header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                        admin_message_to_user[header_msg.message_id] = int(user.id)
 
             # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
             else:
-                await bot.copy_message(
+                res = await bot.copy_message(
                     chat_id=ADMIN_CHAT_ID, from_chat_id=first_message.chat.id, message_id=first_message.message_id
                 )
-                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                admin_message_to_user[res.message_id] = int(user.id)
+                header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                admin_message_to_user[header_msg.message_id] = int(user.id)
 
             # уведомляем пользователя и помечаем заявку
             await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.\nОжидайте ответа.")
@@ -448,13 +539,13 @@ async def handle_submission(messages: Union[Message, List[Message]]):
 # Новый обработчик: собирает сообщения от пользователя в буфер и запускает задачу-коллектор
 @dp.message(F.chat.type == "private")
 async def collect_user_messages(message: Message):
+    # логируем язык при любом личном сообщении
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
     if not await ensure_private_and_autoleave(message):
         return
     user = message.from_user
     user_id_str = str(user.id)
-
-    # Обновляем язык
-    update_user_lang(user_id_str, user.language_code or "unknown")
 
     # Если у пользователя нет активной заявки — ничего не делаем
     if not has_active_request(user_id_str) or load_requests().get(user_id_str, {}).get("submitted"):
@@ -482,6 +573,49 @@ async def collect_user_messages(message: Message):
 
     task = asyncio.create_task(_collector(user_id_str))
     collecting_tasks[user_id_str] = task
+
+
+# ===================== АДМИН: ответ reply -> пользователю =====================
+@dp.message(F.chat.id == ADMIN_CHAT_ID)
+async def admin_reply_handler(message: Message):
+    """
+    Если админ отвечает reply'ом на сообщение в админ-чате, и это сообщение было ранее
+    связано с user_id (в admin_message_to_user), то копируем сообщение (reply от админа)
+    пользователю.
+    """
+    # разрешаем только админам
+    if message.from_user.id not in ADMINS and message.from_user.id != MAIN_ADMIN_ID:
+        return
+
+    if not message.reply_to_message:
+        return
+
+    replied = message.reply_to_message
+    target_user_id = admin_message_to_user.get(replied.message_id)
+    if not target_user_id:
+        # Если нет в маппинге — попробуем проверить reply_to_message.forward_from (иногда присутствует)
+        ffrom = getattr(replied, "forward_from", None)
+        if ffrom and getattr(ffrom, "id", None):
+            target_user_id = ffrom.id
+
+    if not target_user_id:
+        # не удалось сопоставить
+        return
+
+    # логируем язык админа (опционально)
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    try:
+        # копируем сообщение из админ-чата в чат пользователя
+        await bot.copy_message(chat_id=target_user_id, from_chat_id=message.chat.id, message_id=message.message_id)
+        # можно уведомить в админ-чате об успехе (тихо)
+        await message.reply("✅ Ответ отправлен пользователю.", quote=False)
+    except TelegramBadRequest as e:
+        print(f"[WARN] Не удалось отправить ответ пользователю {target_user_id}: {e}")
+        await message.reply("⚠️ Не удалось отправить ответ пользователю.", quote=False)
+    except Exception as e:
+        print(f"[ERROR] Ошибка при пересылке ответа пользователю: {e}")
+        await message.reply("⚠️ Ошибка при пересылке ответа пользователю.", quote=False)
 
 
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
