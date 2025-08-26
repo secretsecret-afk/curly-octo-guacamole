@@ -724,6 +724,90 @@ async def ban_request(callback: CallbackQuery):
         pass
 
 
+# ------------------ COMMAND /ban (added) ------------------
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, f"Команда /ban ({message.text})")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    target_id: Optional[int] = None
+
+    # /ban <id>
+    if len(parts) > 1 and parts[1].strip():
+        try:
+            target_id = int(parts[1].strip())
+        except ValueError:
+            await message.reply("Неверный id. Использование: /ban <user_id>")
+            return
+    else:
+        # или reply на сообщении бота в админ-чате
+        if message.reply_to_message:
+            replied_key = _admin_map_key(message.reply_to_message.chat.id, message.reply_to_message.message_id)
+            target_id = admin_message_to_user.get(replied_key)
+            if not target_id:
+                ffrom = getattr(message.reply_to_message, "forward_from", None)
+                if ffrom and getattr(ffrom, "id", None):
+                    target_id = ffrom.id
+        if not target_id:
+            await message.reply("Укажите id: /ban <user_id> или сделайте reply на сообщении бота в админ-чате.")
+            return
+
+    # Выполняем бан и чистку
+    try:
+        ban_user_by_id(target_id)
+    except Exception as e:
+        await message.reply(f"Ошибка при добавлении в бан-лист: {e}")
+        return
+
+    # Удаляем/закрываем заявку пользователя, буферы, задачи
+    try:
+        remove_request(str(target_id))
+    except Exception:
+        pass
+    try:
+        submission_buffers.pop(str(target_id), None)
+    except Exception:
+        pass
+    try:
+        task = collecting_tasks.pop(str(target_id), None)
+        if task and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Убираем inline-кнопки и маппинги у всех сообщений админ-чатов, относящихся к этому userid
+    try:
+        for k, v in list(admin_message_to_user.items()):
+            try:
+                if int(v) == int(target_id):
+                    chat_s, msg_s = k.split(":", 1)
+                    chat_id = int(chat_s); msg_id = int(msg_s)
+                    try:
+                        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
+                    except Exception:
+                        pass
+                    remove_admin_map_by_key(k)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[WARN] Ошибка при очистке админских сообщений для {target_id}: {e}")
+
+    # уведомляем админа и пользователя
+    await message.reply(f"🔒 Пользователь {target_id} заблокирован и его заявка закрыта.")
+    try:
+        await bot.send_message(chat_id=target_id, text="🔒 Вы были заблокированы. Связаться с поддержкой нельзя.")
+    except Exception:
+        pass
+
+
 # ------------------ UNBAN: команда и callback ------------------
 
 @dp.message(Command("unban"))
