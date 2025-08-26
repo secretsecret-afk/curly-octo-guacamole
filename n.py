@@ -154,37 +154,7 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
         return False
     return True
 
-# ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
-
-class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, wait: float = 1.0):
-        super().__init__()
-        self.wait = wait
-        self._buffer: Dict[str, List[Message]] = defaultdict(list)
-        self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-    async def __call__(
-        self,
-        handler: Callable[[Union[Message, List[Message]], Dict[str, Any]], Awaitable[Any]],
-        event: Message,
-        data: Dict[str, Any]
-    ) -> Any:
-        if not isinstance(event, Message) or not event.media_group_id:
-            return await handler(event, data)
-
-        group_id = str(event.media_group_id)
-        async with self._locks[group_id]:
-            self._buffer[group_id].append(event)
-            await asyncio.sleep(self.wait)
-            messages = self._buffer.pop(group_id, [])
-            if not messages:
-                return
-
-            messages.sort(key=lambda m: m.message_id)
-            data["album"] = messages
-            return await handler(messages, data)
-
-dp.message.middleware(AlbumMiddleware(wait=1.0))
+c
 
 # ===================== HANDLERS =====================
 
@@ -288,29 +258,33 @@ async def reject_request(callback: CallbackQuery):
 
 # ===================== ПРИЁМ ЗАЯВОК (с копированием) =====================
 
+from typing import List, Optional, Union
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+)
+from aiogram.exceptions import TelegramBadRequest
+
 @dp.message()
 async def handle_submission(messages: Union[Message, List[Message]], album: Optional[List[Message]] = None):
-    # Определяем первое сообщение и пользователя
-    first_message = messages[0] if isinstance(messages, list) else messages
-    if not await ensure_private_and_autoleave(first_message): return
-    
+    # Определяем первое сообщение и проверяем личку
+    first_message: Message = messages[0] if isinstance(messages, list) else messages
+    if not await ensure_private_and_autoleave(first_message):
+        return
+
     user = first_message.from_user
     user_id_str = str(user.id)
 
-    # Блокируем, чтобы избежать двойной отправки
     async with user_submission_locks[user_id_str]:
-        # Проверяем, есть ли у пользователя активная заявка
         if not has_active_request(user_id_str):
             return
 
-        # Обновляем язык пользователя в нашей базе
         update_user_lang(user_id_str, user.language_code or "unknown")
 
-        # Создаем заголовок и клавиатуру для админа
+        # Шапка для админов + клавиатура
         header = (
-            f"<b>{user.full_name}</b> "
-            f"(id <code>{user.id}</code> | "
-            f"Языки: {user.language_code or 'неизвестно'})"
+            f"<b><a href=\"tg://user?id={user.id}\">{user.full_name}</a></b> "
+            f"(id <code>{user.id}</code> | Языки: {user.language_code or 'неизвестно'})"
         )
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -318,44 +292,61 @@ async def handle_submission(messages: Union[Message, List[Message]], album: Opti
             ]
         )
 
-        submission_sent = False
         try:
             # ===== АЛЬБОМ =====
             if isinstance(messages, list):
-                # Копируем каждое сообщение из альбома по отдельности
-                for m in messages:
-                    await bot.copy_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        from_chat_id=m.chat.id,
-                        message_id=m.message_id
-                    )
-                # После всех сообщений альбома отправляем заголовок с информацией
+                # На всякий случай сортируем по id (порядок прихода не гарантирован)
+                album_msgs: List[Message] = sorted(messages, key=lambda m: m.message_id)
+
+                media_group = []
+                for i, m in enumerate(album_msgs):
+                    caption = m.html_text or m.caption_html or None
+                    # подпись только на первом элементе
+                    cap = caption if i == 0 else None
+
+                    if m.photo:
+                        file_id = m.photo[-1].file_id  # самое большое фото
+                        media_group.append(InputMediaPhoto(media=file_id, caption=cap, parse_mode="HTML"))
+                    elif m.video:
+                        media_group.append(InputMediaVideo(media=m.video.file_id, caption=cap, parse_mode="HTML"))
+                    elif getattr(m, "document", None):
+                        media_group.append(InputMediaDocument(media=m.document.file_id, caption=cap, parse_mode="HTML"))
+                    elif getattr(m, "audio", None):
+                        media_group.append(InputMediaAudio(media=m.audio.file_id, caption=cap, parse_mode="HTML"))
+                    else:
+                        # если встретился тип, не поддерживаемый в альбомах — просто докинем отдельно
+                        await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
+
+                if media_group:
+                    await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media_group)
+
+                # после группы — отправляем шапку с кнопкой
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
 
             # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
             else:
-                # Копируем одно сообщение
                 await bot.copy_message(
                     chat_id=ADMIN_CHAT_ID,
-                    from_chat_id=messages.chat.id,
-                    message_id=messages.message_id
+                    from_chat_id=first_message.chat.id,
+                    message_id=first_message.message_id
                 )
-                # И сразу за ним отправляем заголовок
                 await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                submission_sent = True
 
-            # Если отправка удалась, уведомляем пользователя и помечаем заявку
-            if submission_sent:
-                await bot.send_message(
-                    chat_id=user.id,
-                    text="✅ Ваша заявка отправлена администраторам. Ожидайте ответа."
-                )
-                mark_submitted(user_id_str)
+            # уведомляем пользователя и помечаем заявку
+            await bot.send_message(
+                chat_id=user.id,
+                text="✅ Ваша заявка отправлена администраторам. Ожидайте ответа."
+            )
+            mark_submitted(user_id_str)
 
+        except TelegramBadRequest as e:
+            # частый кейс: неверная комбинация media/caption или слишком длинная подпись
+            print(f"[BAD_REQUEST] {e!r}")
+            await first_message.answer("⚠️ Не удалось отправить альбом администраторам. Попробуйте ещё раз (или без подписи).")
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
             await first_message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
+
 
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 
