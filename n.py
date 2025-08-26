@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import json
 import asyncio
@@ -36,16 +33,13 @@ load_dotenv(".env.prem")
 
 
 def _parse_int_list(env_name: str) -> List[int]:
-    """Распарсить список целых из переменной окружения.
-    Разделители: запятая, точка с запятой или пробел.
-    Нечисловые символы в части будут удалены, если останутся цифры — то будут использованы."""
     raw = os.getenv(env_name, "")
     if raw is None:
         return []
     s = str(raw).strip()
     if not s:
         return []
-    parts = []
+    parts: List[int] = []
     for part in [p.strip() for p in s.replace(";", ",").replace(" ", ",").split(",")]:
         if not part:
             continue
@@ -63,15 +57,17 @@ def _parse_int_list(env_name: str) -> List[int]:
 
 
 # Parse:
-ADMIN_CHAT_IDS = _parse_int_list("ADMIN_CHAT_ID")  # можно указать несколько chat id
+ADMIN_CHAT_IDS = _parse_int_list("ADMIN_CHAT_ID")  # можно несколько
 ADMIN_CHAT_ID = ADMIN_CHAT_IDS[0] if ADMIN_CHAT_IDS else 0
 MAIN_ADMIN_IDS = _parse_int_list("MAIN_ADMIN_ID")
 ADMINS = _parse_int_list("ADMINS")
+ADMIN_THREAD_IDS = _parse_int_list("ADMIN_THREAD_ID")      # optional topic ids for submissions (per admin chat)
+ADMIN_LOG_THREAD_IDS = _parse_int_list("ADMIN_LOG_THREAD_ID")  # optional topic ids for logs (per admin chat)
 
 # Combined admin sets for permission checks
 ALL_ADMINS_SET = set(ADMINS) | set(MAIN_ADMIN_IDS)
 
-print(f"[ENV] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+print(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
 
 # ===================== Bot init =====================
 API_TOKEN = os.getenv("BOT_TOKEN2")
@@ -88,14 +84,14 @@ REQUESTS_FILE = "requests.json"
 CONFIG_FILE = "config.json"
 WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
 BANNED_FILE = "banned.json"
-ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг admin_message_id -> user_id
+ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg" -> user_id
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
 collecting_tasks: Dict[str, asyncio.Task] = {}
 
-# mapping admin chat message_id -> user_id (для reply из админ-чата)
-admin_message_to_user: Dict[int, int] = {}
+# mapping admin chat+message -> user_id (ключ: "chat:msgid")
+admin_message_to_user: Dict[str, int] = {}
 
 # ===================== STORAGE & MAPS & BANS =====================
 
@@ -165,35 +161,44 @@ def is_banned(uid: Union[int, str]) -> bool:
     return uid_int in load_banned()
 
 
-def load_admin_map() -> Dict[int, int]:
+def load_admin_map() -> Dict[str, int]:
     if not os.path.exists(ADMIN_MAP_FILE):
         return {}
     try:
         with open(ADMIN_MAP_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-            return {int(k): int(v) for k, v in (raw.items() if isinstance(raw, dict) else {})}
+            return {str(k): int(v) for k, v in (raw.items() if isinstance(raw, dict) else {})}
     except Exception:
         return {}
 
 
-def save_admin_map(m: Dict[int, int]) -> None:
+def save_admin_map(m: Dict[str, int]) -> None:
     try:
-        raw = {str(k): v for k, v in m.items()}
         with open(ADMIN_MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+            json.dump(m, f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"[WARN] Не удалось сохранить {ADMIN_MAP_FILE}: {e}")
 
 
-def set_admin_map(msg_id: int, user_id: int) -> None:
-    admin_message_to_user[msg_id] = user_id
+def _admin_map_key(chat_id: int, message_id: int) -> str:
+    return f"{chat_id}:{message_id}"
+
+
+def set_admin_map(chat_id: int, msg_id: int, user_id: int) -> None:
+    key = _admin_map_key(chat_id, msg_id)
+    admin_message_to_user[key] = user_id
     save_admin_map(admin_message_to_user)
 
 
-def remove_admin_map(msg_id: int) -> None:
-    if msg_id in admin_message_to_user:
-        del admin_message_to_user[msg_id]
+def remove_admin_map_by_key(key: str) -> None:
+    if key in admin_message_to_user:
+        del admin_message_to_user[key]
         save_admin_map(admin_message_to_user)
+
+
+def remove_admin_map(chat_id: int, msg_id: int) -> None:
+    key = _admin_map_key(chat_id, msg_id)
+    remove_admin_map_by_key(key)
 
 
 # загрузим маппинг при старте
@@ -309,35 +314,93 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
 # ===================== EDIT ORIGINAL HELPERS =====================
 
 async def _try_edit_original_message(chat_id: int, message_id: int, text: str, reply_markup, prefer_caption: bool) -> bool:
-    """
-    Пытается отредактировать существующее сообщение (chat_id/message_id).
-    Возвращает True если одно из редактирований прошло.
-    prefer_caption = True -> сначала пробуем edit_message_caption, затем edit_message_text.
-    """
-    # 1) Попытка 1 — предпочитаем caption (когда сообщение медиа)
     if prefer_caption:
         try:
             await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
             return True
         except Exception:
             pass
-
-    # 2) Попытка 2 — edit text
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
         return True
     except Exception:
         pass
-
-    # 3) Попытка 3 — если не пробовали caption в начале, попробуем сейчас
     try:
         await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
         return True
     except Exception:
         pass
-
-    # 4) Всё упало
     return False
+
+
+# ===================== HELP: thread selection =====================
+
+def get_thread_for_chat(chat_id: int) -> Optional[int]:
+    try:
+        idx = ADMIN_CHAT_IDS.index(chat_id)
+    except ValueError:
+        return None
+    if idx < len(ADMIN_THREAD_IDS):
+        return ADMIN_THREAD_IDS[idx]
+    return None
+
+
+def get_log_thread_for_chat(chat_id: int) -> Optional[int]:
+    try:
+        idx = ADMIN_CHAT_IDS.index(chat_id)
+    except ValueError:
+        return None
+    if idx < len(ADMIN_LOG_THREAD_IDS):
+        return ADMIN_LOG_THREAD_IDS[idx]
+    return None
+
+
+# ===================== LOGGING USER ACTIONS =====================
+
+async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict, object], action: str) -> None:
+    """
+    Логирует событие action для пользователя во все admin_chat'ы, в соответствующие log topics (если заданы).
+    user_obj может быть Message или CallbackQuery или объект with .from_user
+    """
+    # Получим User-like объект
+    if isinstance(user_obj, CallbackQuery):
+        user = user_obj.from_user
+    elif isinstance(user_obj, Message):
+        user = user_obj.from_user
+    else:
+        # попытка взять .from_user или .user
+        user = getattr(user_obj, "from_user", None) or getattr(user_obj, "user", None)
+
+    if not user:
+        return
+
+    uid = user.id
+    uid_str = str(uid)
+    # Возьмём языки из requests (если есть)
+    data = load_requests()
+    user_rec = data.get(uid_str, {})
+    langs = user_rec.get("langs", [])
+    if not langs and getattr(user, "language_code", None):
+        langs = [user.language_code]
+
+    safe_full_name = escape(user.full_name or "(без имени)")
+    safe_username = f"@{escape(user.username)}" if getattr(user, "username", None) else ""
+    safe_langs = ", ".join(escape(str(x)) for x in langs) if langs else "неизвестно"
+    tm = _now().isoformat(sep=" ", timespec="seconds")
+    header = f"{safe_full_name} {safe_username}\nID: {uid}\nЯзыки: {safe_langs}\nВремя: {tm}\n\n"
+    text = header + f"Действие: {escape(action)}"
+
+    # Отправляем в каждый admin chat (в thread если задан)
+    for admin_chat in ADMIN_CHAT_IDS:
+        thread_id = get_log_thread_for_chat(admin_chat)
+        try:
+            if thread_id is not None:
+                await bot.send_message(chat_id=admin_chat, text=text, message_thread_id=thread_id)
+            else:
+                await bot.send_message(chat_id=admin_chat, text=text)
+        except Exception as e:
+            # не фатально, логируем на stdout
+            print(f"[WARN] Не удалось отправить лог в {admin_chat} (thread {thread_id}): {e}")
 
 
 # ===================== HANDLERS =====================
@@ -347,8 +410,11 @@ async def _try_edit_original_message(chat_id: int, message_id: int, text: str, r
 async def send_welcome(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
+    # логируем команду /start
+    await log_user_action(message, "/start")
+
     if is_banned(message.from_user.id):
-        await message.answer("🔒 Вы заблокированы.")
+        await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
         return
 
     if not await ensure_private_and_autoleave(message):
@@ -378,6 +444,9 @@ async def send_welcome(message: Message):
 async def set_price(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
+    # логируем попытку изменить цену (для аудита)
+    await log_user_action(message, f"Команда /setprice ({message.text})")
+
     # разрешено только мейн-админам
     if message.from_user.id not in MAIN_ADMIN_IDS:
         return
@@ -394,53 +463,46 @@ async def set_price(message: Message):
 
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
-    # логируем язык на нажатие кнопки Premium
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
-    # если забанен — не продолжать
+    # логируем действие пользователя
+    await log_user_action(callback, "Нажал кнопку: Premium")
+
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        await callback.answer("🔒 Вы заблокены.", show_alert=True)
         return
 
     # построим клавиатуру оплаты
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇷🇺 Картой", callback_data="pay_card")],
-        [InlineKeyboardButton(text="🌎 Crypto (@send) (0%)", callback_data="pay_crypto")],
+        [InlineKeyboardButton(text="💳 Картой", callback_data="pay_card")],
+        [InlineKeyboardButton(text="🪙 Crypto (@send) (0%)", callback_data="pay_crypto")],
         [InlineKeyboardButton(text="⭐ Telegram Stars", callback_data="pay_stars")],
-        [InlineKeyboardButton(text="🏠", callback_data="home")],
+        [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
     ])
 
-    # Собираем параметры для редактирования оригинала
     orig_chat_id = callback.message.chat.id
     orig_msg_id = callback.message.message_id
-
-    # Определяем, предпочтителен ли caption (если исходное сообщение содержит медиа)
     content_type = getattr(callback.message, "content_type", None)
     prefer_caption = content_type in ("photo", "video", "document", "animation") or bool(getattr(callback.message, "photo", None))
-
-    # Текст, который хотим поместить
     new_text = "Вы выбрали Premium"
 
-    # Пытаемся отредактировать оригинал (несколько попыток внутри функции)
     ok = await _try_edit_original_message(orig_chat_id, orig_msg_id, new_text, keyboard, prefer_caption)
-
     if ok:
-        # Успешно отредактировали оригинал — подтверждаем взаимодействие (тихо)
         await callback.answer()
         return
 
-    # Если редактирование не удалось — сообщаем пользователю (не создаём новый message по вашей просьбе)
     await callback.answer("⚠️ Не удалось обновить сообщение. Попробуйте ещё раз.", show_alert=True)
 
 
 @dp.callback_query(F.data == "home")
 async def go_home(callback: CallbackQuery):
-    # логируем язык при возврате домой
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
-    # если забанен — не продолжать
+    # логируем действие пользователя
+    await log_user_action(callback, "Нажал кнопку: Домой")
+
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        await callback.answer("🔒 Вы заблокены.", show_alert=True)
         return
 
     price = load_config()["price"]
@@ -457,17 +519,14 @@ async def go_home(callback: CallbackQuery):
 
     orig_chat_id = callback.message.chat.id
     orig_msg_id = callback.message.message_id
-
     content_type = getattr(callback.message, "content_type", None)
     prefer_caption = content_type in ("photo", "video", "document", "animation") or bool(getattr(callback.message, "photo", None))
 
     ok = await _try_edit_original_message(orig_chat_id, orig_msg_id, caption, keyboard, prefer_caption)
-
     if ok:
         await callback.answer()
         return
 
-    # Если редактирование не удалось — уведомляем адекватно
     await callback.answer("⚠️ Не удалось обновить приветствие. Попробуйте ещё раз.", show_alert=True)
 
 
@@ -475,8 +534,11 @@ async def go_home(callback: CallbackQuery):
 async def ask_screenshots(callback: CallbackQuery):
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
+    # логируем выбор способа оплаты
+    await log_user_action(callback, f"Выбрал способ оплаты: {callback.data}")
+
     if is_banned(callback.from_user.id):
-        await callback.answer("🔒 Вы заблокированы.", show_alert=True)
+        await callback.answer("🔒 Вы заблокены.", show_alert=True)
         return
 
     await callback.answer()
@@ -491,7 +553,7 @@ async def ask_screenshots(callback: CallbackQuery):
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
-        "Отправьте скриншоты ваших первых сообщений в:\n"
+        "📸 Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
         "• Gene's Land чат\n\n"
         "А также (по желанию) фото прошитого 4G модема.\n\n"
@@ -514,6 +576,9 @@ async def ask_screenshots(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
+    # логируем действие админа (отклонение)
+    await log_user_action(callback, f"Админ {callback.from_user.id} отклонил заявку {callback.data}")
 
     await callback.answer("Заявка отклонена и удалена ❌")
     if callback.message.chat.id not in ADMIN_CHAT_IDS:
@@ -538,6 +603,9 @@ async def reject_request(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("ban_"))
 async def ban_request(callback: CallbackQuery):
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
+    # логируем действие админа (бан)
+    await log_user_action(callback, f"Админ {callback.from_user.id} заблокировал пользователя {callback.data}")
 
     await callback.answer("Пользователь заблокирован 🔒")
     if callback.message.chat.id not in ADMIN_CHAT_IDS:
@@ -566,7 +634,7 @@ async def ban_request(callback: CallbackQuery):
         print(f"[WARN] Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
 
     try:
-        await bot.send_message(uid, "🔒 Вы были заблокированы.")
+        await bot.send_message(uid, "🔒 Вы были заблокированы. Связаться с поддержкой нельзя.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {uid}: {e}")
 
@@ -580,6 +648,11 @@ async def ban_request(callback: CallbackQuery):
 
 @dp.message(Command("unban"))
 async def cmd_unban(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # логируем действие админа (unban)
+    await log_user_action(message, f"Команда /unban ({message.text})")
+
     if message.from_user.id not in ALL_ADMINS_SET:
         return
 
@@ -593,8 +666,8 @@ async def cmd_unban(message: Message):
             return
     else:
         if message.reply_to_message:
-            replied_id = message.reply_to_message.message_id
-            target_id = admin_message_to_user.get(replied_id)
+            replied_key = _admin_map_key(message.reply_to_message.chat.id, message.reply_to_message.message_id)
+            target_id = admin_message_to_user.get(replied_key)
         if not target_id:
             await message.reply("Укажите id: /unban <user_id> или выполните команду через reply на сообщении бота в админ-чате.")
             return
@@ -612,7 +685,7 @@ async def cmd_unban(message: Message):
 
     await message.reply(f"✅ Пользователь {target_id} разблокирован.")
     try:
-        await bot.send_message(chat_id=target_id, text="🔓 Вас разблокировали.")
+        await bot.send_message(chat_id=target_id, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
     except Exception:
         pass
 
@@ -649,7 +722,7 @@ async def unban_request(callback: CallbackQuery):
 
     await callback.message.answer(f"✅ Пользователь {uid} разблокирован.")
     try:
-        await bot.send_message(chat_id=uid, text="🔓 Вас разблокировали.")
+        await bot.send_message(chat_id=uid, text="🔓 Вас разблокировали. Вы можете подать заявку снова.")
     except Exception:
         pass
 
@@ -661,6 +734,11 @@ async def unban_request(callback: CallbackQuery):
 
 @dp.message(Command("banned"))
 async def cmd_banned(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # логирование просмотра списка забаненных
+    await log_user_action(message, "Команда /banned")
+
     if message.from_user.id not in ALL_ADMINS_SET:
         return
     banned = load_banned()
@@ -691,7 +769,7 @@ async def handle_submission(messages: Union[Message, List[Message]]):
             except Exception:
                 pass
         try:
-            await bot.send_message(chat_id=user.id, text="🔒 Вы заблокированы.")
+            await bot.send_message(chat_id=user.id, text="🔒 Вы заблокированы. Ваша заявка удалена.")
         except Exception:
             pass
         return
@@ -715,46 +793,49 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         )
 
         try:
-            if isinstance(messages, list):
-                album_msgs: List[Message] = sorted(messages, key=lambda m: m.message_id)
-                media_group_ids = {getattr(m, "media_group_id", None) for m in album_msgs}
-                if len(media_group_ids) == 1 and next(iter(media_group_ids)) is not None:
-                    for m in album_msgs:
-                        res = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
-                        set_admin_map(res.message_id, int(user.id))
-                    header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                    set_admin_map(header_msg.message_id, int(user.id))
-                else:
-                    media_group = []
-                    for i, m in enumerate(album_msgs):
-                        caption = getattr(m, "html_text", None) or getattr(m, "caption_html", None) or None
-                        cap = caption if i == 0 else None
-                        if m.photo:
-                            file_id = m.photo[-1].file_id
-                            media_group.append(InputMediaPhoto(media=file_id, caption=cap, parse_mode="HTML"))
-                        elif m.video:
-                            media_group.append(InputMediaVideo(media=m.video.file_id, caption=cap, parse_mode="HTML"))
-                        elif getattr(m, "document", None):
-                            media_group.append(InputMediaDocument(media=m.document.file_id, caption=cap, parse_mode="HTML"))
-                        elif getattr(m, "audio", None):
-                            media_group.append(InputMediaAudio(media=m.audio.file_id, caption=cap, parse_mode="HTML"))
-                        else:
-                            res = await bot.copy_message(chat_id=ADMIN_CHAT_ID, from_chat_id=m.chat.id, message_id=m.message_id)
-                            set_admin_map(res.message_id, int(user.id))
-                    if media_group:
-                        sent = await bot.send_media_group(chat_id=ADMIN_CHAT_ID, media=media_group)
-                        for s in sent:
-                            set_admin_map(s.message_id, int(user.id))
-                        header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                        set_admin_map(header_msg.message_id, int(user.id))
-            else:
-                res = await bot.copy_message(
-                    chat_id=ADMIN_CHAT_ID, from_chat_id=first_message.chat.id, message_id=first_message.message_id
-                )
-                set_admin_map(res.message_id, int(user.id))
-                header_msg = await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                set_admin_map(header_msg.message_id, int(user.id))
+            # Для каждого admin chat отправляем копии и шапку (в topic, если задан)
+            for admin_chat in ADMIN_CHAT_IDS:
+                thread_id = get_thread_for_chat(admin_chat)  # может быть None
 
+                if isinstance(messages, list):
+                    album_msgs: List[Message] = sorted(messages, key=lambda m: m.message_id)
+                    media_group_ids = {getattr(m, "media_group_id", None) for m in album_msgs}
+                    if len(media_group_ids) == 1 and next(iter(media_group_ids)) is not None:
+                        for m in album_msgs:
+                            res = await bot.copy_message(chat_id=admin_chat, from_chat_id=m.chat.id, message_id=m.message_id, message_thread_id=thread_id)
+                            set_admin_map(admin_chat, res.message_id, int(user.id))
+                        header_msg = await bot.send_message(admin_chat, text=header, reply_markup=admin_keyboard, message_thread_id=thread_id)
+                        set_admin_map(admin_chat, header_msg.message_id, int(user.id))
+                    else:
+                        media_group = []
+                        for i, m in enumerate(album_msgs):
+                            caption = getattr(m, "html_text", None) or getattr(m, "caption_html", None) or None
+                            cap = caption if i == 0 else None
+                            if m.photo:
+                                file_id = m.photo[-1].file_id
+                                media_group.append(InputMediaPhoto(media=file_id, caption=cap, parse_mode="HTML"))
+                            elif m.video:
+                                media_group.append(InputMediaVideo(media=m.video.file_id, caption=cap, parse_mode="HTML"))
+                            elif getattr(m, "document", None):
+                                media_group.append(InputMediaDocument(media=m.document.file_id, caption=cap, parse_mode="HTML"))
+                            elif getattr(m, "audio", None):
+                                media_group.append(InputMediaAudio(media=m.audio.file_id, caption=cap, parse_mode="HTML"))
+                            else:
+                                res = await bot.copy_message(chat_id=admin_chat, from_chat_id=m.chat.id, message_id=m.message_id, message_thread_id=thread_id)
+                                set_admin_map(admin_chat, res.message_id, int(user.id))
+                        if media_group:
+                            sent = await bot.send_media_group(chat_id=admin_chat, media=media_group, message_thread_id=thread_id)
+                            for s in sent:
+                                set_admin_map(admin_chat, s.message_id, int(user.id))
+                            header_msg = await bot.send_message(admin_chat, text=header, reply_markup=admin_keyboard, message_thread_id=thread_id)
+                            set_admin_map(admin_chat, header_msg.message_id, int(user.id))
+                else:
+                    res = await bot.copy_message(chat_id=admin_chat, from_chat_id=first_message.chat.id, message_id=first_message.message_id, message_thread_id=thread_id)
+                    set_admin_map(admin_chat, res.message_id, int(user.id))
+                    header_msg = await bot.send_message(admin_chat, text=header, reply_markup=admin_keyboard, message_thread_id=thread_id)
+                    set_admin_map(admin_chat, header_msg.message_id, int(user.id))
+
+            # уведомляем пользователя и помечаем заявку
             await bot.send_message(chat_id=user.id, text="✅ Ваша заявка отправлена администраторам.\nОжидайте ответа.")
             mark_submitted(user_id_str)
 
@@ -771,6 +852,9 @@ async def handle_submission(messages: Union[Message, List[Message]]):
 async def collect_user_messages(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
+    # можно логировать отправку сообщений пользователем (необязательно)
+    # await log_user_action(message, "Отправил сообщение в личку")
+
     if is_banned(message.from_user.id):
         remove_request(str(message.from_user.id))
         submission_buffers.pop(str(message.from_user.id), None)
@@ -781,7 +865,7 @@ async def collect_user_messages(message: Message):
             except Exception:
                 pass
         try:
-            await message.answer("🔒 Вы заблокированы.")
+            await message.answer("🔒 Вы заблокированы. Связаться с поддержкой нельзя.")
         except Exception:
             pass
         return
@@ -826,7 +910,8 @@ async def admin_reply_handler(message: Message):
         return
 
     replied = message.reply_to_message
-    target_user_id = admin_message_to_user.get(replied.message_id)
+    key = _admin_map_key(replied.chat.id, replied.message_id)
+    target_user_id = admin_message_to_user.get(key)
     if not target_user_id:
         ffrom = getattr(replied, "forward_from", None)
         if ffrom and getattr(ffrom, "id", None):
@@ -875,7 +960,7 @@ async def leave_any_group(message: Message):
 
 # ===================== MAIN =====================
 async def main():
-    print(f"[BOOT] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+    print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
     await dp.start_polling(bot)
 
 
