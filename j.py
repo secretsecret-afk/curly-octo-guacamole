@@ -14,6 +14,7 @@ from aiogram.types import (
     FSInputFile
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
+from aiogram.enums import ParseMode
 
 # ===================== ENV =====================
 
@@ -28,7 +29,7 @@ if not API_TOKEN:
 if ADMIN_CHAT_ID == 0:
     print("[WARN] ADMIN_CHAT_ID=0 — заявки не попадут в админ-чат. Проверь .env.prem")
 
-bot = Bot(token=API_TOKEN)
+bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # Объект для блокировки одновременной обработки заявок от одного пользователя
@@ -150,11 +151,6 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
         return False
     return True
 
-def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
-    username = f"@{user.username}" if user.username else "—"
-    langs_str = ", ".join(langs) or "—"
-    return f"{user.full_name} | id {user.id} | {username} | Языки: {langs_str}"
-
 # ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
 
 class AlbumMiddleware(BaseMiddleware):
@@ -183,7 +179,6 @@ class AlbumMiddleware(BaseMiddleware):
 
             messages.sort(key=lambda m: m.message_id)
             data["album"] = messages
-            # Передаем весь список сообщений
             return await handler(messages, data)
 
 dp.message.middleware(AlbumMiddleware(wait=1.0))
@@ -288,63 +283,72 @@ async def reject_request(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception: pass
 
-# ===================== ПРИЁМ ЗАЯВОК (с пересылкой альбомов) =====================
+# ===================== ПРИЁМ ЗАЯВОК (с копированием) =====================
 
 @dp.message()
 async def handle_submission(messages: Union[Message, List[Message]], album: Optional[List[Message]] = None):
-    # messages может быть как одиночным сообщением, так и списком (альбом)
-    if isinstance(messages, list):
-        first_message = messages[0]
-    else:
-        first_message = messages
-
+    # Определяем первое сообщение и пользователя
+    first_message = messages[0] if isinstance(messages, list) else messages
     if not await ensure_private_and_autoleave(first_message): return
-    user, user_id = first_message.from_user, str(first_message.from_user.id)
+    
+    user = first_message.from_user
+    user_id_str = str(user.id)
 
-    async with user_submission_locks[user_id]:
-        if not has_active_request(user_id):
+    # Блокируем, чтобы избежать двойной отправки
+    async with user_submission_locks[user_id_str]:
+        # Проверяем, есть ли у пользователя активная заявка
+        if not has_active_request(user_id_str):
             return
 
-        langs = update_user_lang(user_id, user.language_code or "unknown")
-        header = make_header(user, langs)
+        # Обновляем язык пользователя в нашей базе
+        update_user_lang(user_id_str, user.language_code or "unknown")
+
+        # Создаем заголовок и клавиатуру для админа
+        header = (
+            f"<b>{user.full_name}</b> "
+            f"(id <code>{user.id}</code> | "
+            f"Языки: {user.language_code or 'неизвестно'})"
+        )
         admin_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user_id}")]]
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]
+            ]
         )
 
         submission_sent = False
         try:
             # ===== АЛЬБОМ =====
             if isinstance(messages, list):
+                # Копируем каждое сообщение из альбома по отдельности
                 for m in messages:
-                    try:
-                        await bot.forward_message(
-                            chat_id=ADMIN_CHAT_ID,
-                            from_chat_id=m.chat.id,
-                            message_id=m.message_id
-                        )
-                        submission_sent = True
-                    except Exception as e:
-                        print(f"[ERROR] Не удалось переслать сообщение альбома: {e}")
-
-                if submission_sent:
-                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                    await bot.copy_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        from_chat_id=m.chat.id,
+                        message_id=m.message_id
+                    )
+                # После всех сообщений альбома отправляем заголовок с информацией
+                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                submission_sent = True
 
             # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
             else:
-                if messages.photo or messages.video or messages.document or messages.text:
-                    await bot.forward_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        from_chat_id=messages.chat.id,
-                        message_id=messages.message_id
-                    )
-                    await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
-                    submission_sent = True
-                else:
-                    return
+                # Копируем одно сообщение
+                await bot.copy_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    from_chat_id=messages.chat.id,
+                    message_id=messages.message_id
+                )
+                # И сразу за ним отправляем заголовок
+                await bot.send_message(ADMIN_CHAT_ID, text=header, reply_markup=admin_keyboard)
+                submission_sent = True
 
+            # Если отправка удалась, уведомляем пользователя и помечаем заявку
             if submission_sent:
-                await first_message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-                mark_submitted(user_id)
+                await bot.send_message(
+                    chat_id=user.id,
+                    text="✅ Ваша заявка отправлена администраторам. Ожидайте ответа."
+                )
+                mark_submitted(user_id_str)
 
         except Exception as e:
             print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
