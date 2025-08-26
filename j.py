@@ -32,6 +32,9 @@ if ADMIN_CHAT_ID == 0:
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
+# [ДОБАВЛЕНО] Объект для блокировки одновременной обработки заявок от одного пользователя
+user_submission_locks = defaultdict(asyncio.Lock)
+
 REQUESTS_FILE = "requests.json"
 CONFIG_FILE = "config.json"
 WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
@@ -173,7 +176,7 @@ def make_header(user: "aiogram.types.User", langs: List[str]) -> str:
 
 # ===================== ALBUM MIDDLEWARE (aiogram 3.x) =====================
 class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, wait: float = 0.35):
+    def __init__(self, wait: float = 1.0): # [ИЗМЕНЕНО] Таймер увеличен до 1 секунды
         super().__init__()
         self.wait = wait
         self._buffer: Dict[str, List[Message]] = defaultdict(list)
@@ -291,23 +294,19 @@ async def ask_screenshots(callback: CallbackQuery):
         "⏳ Срок одобрения заявки ~3 дня."
     )
 
-    # [ИЗМЕНЕНО] Проверяем, видел ли пользователь инструкцию раньше
     data = load_requests()
     user_record = data.get(user_id_str, {})
     has_seen = user_record.get("has_seen_instructions", False)
 
     if not has_seen:
-        # Если видит в первый раз - показываем задержку
         preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
         await asyncio.sleep(random.randint(4234, 10110) / 1000)
         await preparing_msg.edit_text(instruction)
         
-        # Помечаем, что пользователь увидел инструкцию
         if user_id_str in data:
             data[user_id_str]["has_seen_instructions"] = True
             save_requests(data)
     else:
-        # Если уже видел - отправляем мгновенно
         await callback.message.answer(instruction)
 
 
@@ -321,7 +320,6 @@ async def reject_request(callback: CallbackQuery):
 
     user_id = callback.data.split("_", 1)[1]
     
-    # [ИЗМЕНЕНО] Удаляем заявку из базы, чтобы пользователь мог подать новую
     data = load_requests()
     if user_id in data:
         del data[user_id]
@@ -329,7 +327,6 @@ async def reject_request(callback: CallbackQuery):
 
     await callback.answer("Заявка отклонена и удалена ❌")
     try:
-        # [ИЗМЕНЕНО] Сообщаем пользователю, что он может попробовать снова
         await bot.send_message(user_id, "❌ Ваша заявка на Gene Premium отклонена. Вы можете попробовать подать её снова, выбрав способ оплаты в /start.")
     except Exception as e:
         print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
@@ -347,70 +344,70 @@ async def handle_submission(message: Message, album: Optional[List[Message]] = N
     user = message.from_user
     user_id = str(user.id)
 
-    if not has_active_request(user_id):
-        return # Молча игнорируем, если нет активного процесса подачи заявки
-
-    langs = update_user_lang(user_id, user.language_code or "unknown")
-    header = make_header(user, langs)
-
-    admin_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
-    )
-
-    try:
-        # ===== АЛЬБОМ =====
-        if album:
-            original_caption = album[0].caption or ""
-            full_caption = f"{header}\n\n{original_caption}".strip()
-            
-            photo_video_builder = MediaGroupBuilder()
-            doc_builder = MediaGroupBuilder()
-
-            for m in album:
-                if m.photo: photo_video_builder.add_photo(m.photo[-1].file_id)
-                elif m.video: photo_video_builder.add_video(m.video.file_id)
-                elif m.document: doc_builder.add_document(m.document.file_id)
-            
-            caption_sent = False
-            media_sent = False
-
-            # [ИСПРАВЛЕНО] Проверяем, есть ли что-то в билдере, перед отправкой
-            pv_built = photo_video_builder.build()
-            if pv_built:
-                pv_built[0].caption = full_caption
-                await bot.send_media_group(ADMIN_CHAT_ID, media=pv_built)
-                caption_sent = True
-                media_sent = True
-
-            doc_built = doc_builder.build()
-            if doc_built:
-                if not caption_sent:
-                    doc_built[0].caption = full_caption
-                await bot.send_media_group(ADMIN_CHAT_ID, media=doc_built)
-                media_sent = True
-            
-            if media_sent:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
-                await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-                mark_submitted(user_id)
-            
+    # [ИЗМЕНЕНО] Блокируем обработку, чтобы избежать "гонки состояний"
+    async with user_submission_locks[user_id]:
+        # Повторно проверяем статус ВНУТРИ блокировки, чтобы второе сообщение не прошло
+        if not has_active_request(user_id):
             return
 
-        # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
-        cap = f"{header}\n\n{message.caption or ''}".strip()
-        if message.photo: await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.document: await bot.send_document(ADMIN_CHAT_ID, document=message.document.file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.video: await bot.send_video(ADMIN_CHAT_ID, video=message.video.file_id, caption=cap, reply_markup=admin_keyboard)
-        elif message.text: await bot.send_message(ADMIN_CHAT_ID, f"{header}\n\n{message.text}", reply_markup=admin_keyboard)
-        else:
-            await bot.send_message(ADMIN_CHAT_ID, f"{header}\n[Неподдерживаемый тип сообщения]", reply_markup=admin_keyboard)
+        langs = update_user_lang(user_id, user.language_code or "unknown")
+        header = make_header(user, langs)
 
-        await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
-        mark_submitted(user_id)
+        admin_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
+        )
 
-    except Exception as e:
-        print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
-        await message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
+        try:
+            # ===== АЛЬБОМ =====
+            if album:
+                original_caption = album[0].caption or ""
+                full_caption = f"{header}\n\n{original_caption}".strip()
+                
+                photo_video_builder = MediaGroupBuilder()
+                doc_builder = MediaGroupBuilder()
+
+                for m in album:
+                    if m.photo: photo_video_builder.add_photo(m.photo[-1].file_id)
+                    elif m.video: photo_video_builder.add_video(m.video.file_id)
+                    elif m.document: doc_builder.add_document(m.document.file_id)
+                
+                caption_sent = False
+                media_sent = False
+
+                pv_built = photo_video_builder.build()
+                if pv_built:
+                    pv_built[0].caption = full_caption
+                    await bot.send_media_group(ADMIN_CHAT_ID, media=pv_built)
+                    caption_sent = True
+                    media_sent = True
+
+                doc_built = doc_builder.build()
+                if doc_built:
+                    if not caption_sent:
+                        doc_built[0].caption = full_caption
+                    await bot.send_media_group(ADMIN_CHAT_ID, media=doc_built)
+                    media_sent = True
+                
+                if media_sent:
+                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text="Управление заявкой:", reply_markup=admin_keyboard)
+                
+            # ===== ОДИНОЧНОЕ СООБЩЕНИЕ =====
+            else:
+                cap = f"{header}\n\n{message.caption or ''}".strip()
+                if message.photo: await bot.send_photo(ADMIN_CHAT_ID, photo=message.photo[-1].file_id, caption=cap, reply_markup=admin_keyboard)
+                elif message.document: await bot.send_document(ADMIN_CHAT_ID, document=message.document.file_id, caption=cap, reply_markup=admin_keyboard)
+                elif message.video: await bot.send_video(ADMIN_CHAT_ID, video=message.video.file_id, caption=cap, reply_markup=admin_keyboard)
+                elif message.text: await bot.send_message(ADMIN_CHAT_ID, f"{header}\n\n{message.text}", reply_markup=admin_keyboard)
+                else:
+                    await bot.send_message(ADMIN_CHAT_ID, f"{header}\n[Неподдерживаемый тип сообщения]", reply_markup=admin_keyboard)
+
+            # Общие действия после любой успешной отправки
+            await message.answer("✅ Ваша заявка отправлена администраторам. Ожидайте ответа.")
+            mark_submitted(user_id)
+
+        except Exception as e:
+            print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
+            await message.answer("⚠️ Не удалось отправить администраторам. Попробуйте ещё раз позже.")
 
 # ===================== АВТО-ЛИВ ИЗ ЧАТОВ =====================
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
@@ -437,4 +434,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())```
+    asyncio.run(main())
