@@ -7,9 +7,10 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
+    InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated, InputMediaPhoto, InputMediaDocument
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
+from aiogram.utils.media_group import MediaGroupFilter
 
 # ---------------------- env ----------------------
 load_dotenv(".env.prem")
@@ -28,23 +29,31 @@ dp = Dispatcher()
 
 REQUESTS_FILE = "requests.json"
 CONFIG_FILE = "config.json"
+WELCOME_IMAGE = "IMG_20250825_170645_742.jpg"
 
 # ---------------------- JSON helpers ----------------------
 def load_requests():
     if os.path.exists(REQUESTS_FILE):
-        with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                data = json.loads(content) if content else {}
+        except json.JSONDecodeError:
+            print(f"[WARN] {REQUESTS_FILE} поврежден, создаем новый.")
+            data = {}
     else:
         data = {}
 
-    # автоочистка старше 3 дней
     now = datetime.now()
     to_delete = []
     for uid, req in list(data.items()):
         ts = req.get("submitted_at")
         if ts:
-            submitted_at = datetime.fromisoformat(ts)
-            if now - submitted_at > timedelta(days=3):
+            try:
+                submitted_at = datetime.fromisoformat(ts)
+                if now - submitted_at > timedelta(days=3):
+                    to_delete.append(uid)
+            except Exception:
                 to_delete.append(uid)
     for uid in to_delete:
         del data[uid]
@@ -74,10 +83,6 @@ def update_user_lang(user_id: str, lang: str):
 
 
 def can_start_new_request(user_id: str) -> bool:
-    """
-    Можно ли НАЧАТЬ НОВУЮ заявку (по кнопке оплаты).
-    Да, если нет записи или прошло >3 дней.
-    """
     data = load_requests()
     rec = data.get(user_id)
     if not rec or not rec.get("submitted_at"):
@@ -87,10 +92,6 @@ def can_start_new_request(user_id: str) -> bool:
 
 
 def has_active_request(user_id: str) -> bool:
-    """
-    Есть ли активная заявка (≤3 дней с момента старта).
-    Нужна для пропуска сообщений пользователя в админ-чат.
-    """
     data = load_requests()
     rec = data.get(user_id)
     if not rec or not rec.get("submitted_at"):
@@ -100,7 +101,6 @@ def has_active_request(user_id: str) -> bool:
 
 
 def start_request(user, langs):
-    """Стартуем/обновляем заявку и фиксируем время начала окна в 3 дня."""
     data = load_requests()
     data[str(user.id)] = {
         "full_name": user.full_name,
@@ -110,21 +110,37 @@ def start_request(user, langs):
     }
     save_requests(data)
 
-# ---------------------- Config (price) ----------------------
+# ---------------------- Config ----------------------
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"price": "9$"}  # дефолт
+    return {"price": "9$"}
 
 
 def save_config(config):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
+# ---------------------- Filters ----------------------
+async def ensure_private(message: Message):
+    """Игнорировать группы (кроме ADMIN_CHAT_ID)"""
+    if message.chat.type in ("group", "supergroup"):
+        if message.chat.id != ADMIN_CHAT_ID:
+            try:
+                await bot.leave_chat(message.chat.id)
+                print(f"[LOG] Бот вышел из чата {message.chat.id}")
+            except Exception as e:
+                print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
+        return False
+    return True
+
 # ---------------------- Handlers ----------------------
 @dp.message(Command("start"))
 async def send_welcome(message: Message):
+    if not await ensure_private(message):
+        return
+
     langs = update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
     print(f"[LOG] Пользователь {message.from_user.id} языки: {','.join(langs)}")
 
@@ -141,11 +157,23 @@ async def send_welcome(message: Message):
             [InlineKeyboardButton(text="🩼 Поддержка", url="https://t.me/genepremiumsupportbot")],
         ]
     )
-    await message.answer(caption, reply_markup=keyboard)
+
+    if os.path.exists(WELCOME_IMAGE):
+        try:
+            with open(WELCOME_IMAGE, "rb") as photo:
+                await message.answer_photo(photo=photo, caption=caption, reply_markup=keyboard)
+        except Exception as e:
+            print(f"[WARN] Не удалось отправить локальную картинку: {e}")
+            await message.answer(caption, reply_markup=keyboard)
+    else:
+        await message.answer(caption, reply_markup=keyboard)
 
 
 @dp.message(Command("setprice"))
 async def set_price(message: Message):
+    if message.chat.id != ADMIN_CHAT_ID:
+        return  # только админ-чат
+
     if message.from_user.id != MAIN_ADMIN_ID:
         await message.answer("❌ У вас нет прав для изменения цены")
         return
@@ -168,6 +196,9 @@ async def set_price(message: Message):
 
 @dp.callback_query(F.data == "premium")
 async def process_premium(callback: CallbackQuery):
+    if callback.message.chat.type != "private":
+        return  # только в ЛС
+
     await callback.answer()
     price = load_config()["price"]
     keyboard = InlineKeyboardMarkup(
@@ -183,26 +214,23 @@ async def process_premium(callback: CallbackQuery):
 
 @dp.callback_query(F.data.in_(["pay_card", "pay_crypto", "pay_stars"]))
 async def ask_screenshots(callback: CallbackQuery):
+    if callback.message.chat.type != "private":
+        return
+
     user = callback.from_user
     langs = update_user_lang(str(user.id), user.language_code or "unknown")
     print(f"[LOG] Пользователь {user.id} языки: {','.join(langs)}")
 
-    # НОВОЕ: проверяем можно ли начать новую заявку
     if not can_start_new_request(str(user.id)):
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
 
-    # Стартуем заявку (открываем 3-дневное окно и сохраняем профиль)
     start_request(user, langs)
-
-    # Сообщение о подготовке
     preparing_msg = await callback.message.answer("⏳ Подготавливаем для вас оплату...")
 
-    # Случайная задержка 4234–10110 мс
     delay = random.randint(4234, 10110) / 1000
     await asyncio.sleep(delay)
 
-    # Инструкция после задержки
     instruction = (
         "Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
@@ -214,14 +242,48 @@ async def ask_screenshots(callback: CallbackQuery):
     )
     await preparing_msg.edit_text(instruction)
 
+# ---------------------- Альбомы ----------------------
+@dp.message(MediaGroupFilter(is_media_group=True))
+async def handle_album(messages: list[Message]):
+    """Обработка альбома (несколько фото/доков) как одной заявки"""
+    message = messages[0]
+    if message.chat.type != "private":
+        return
 
+    user = message.from_user
+    if not has_active_request(str(user.id)):
+        await message.answer("Чтобы подать заявку, выберите способ оплаты в меню /start и следуйте инструкции.")
+        return
+
+    username = f"@{user.username}" if user.username else "—"
+    langs = ", ".join(load_requests().get(str(user.id), {}).get("langs", [])) or "—"
+    header = f"{user.full_name} | id {user.id} | {username} | Языки: {langs}"
+
+    media = []
+    for msg in messages:
+        if msg.photo:
+            media.append(InputMediaPhoto(media=msg.photo[-1].file_id))
+        elif msg.document:
+            media.append(InputMediaDocument(media=msg.document.file_id))
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
+    )
+
+    if media:
+        media[0].caption = header
+        await bot.send_media_group(ADMIN_CHAT_ID, media=media)
+        await bot.send_message(ADMIN_CHAT_ID, "Управление заявкой:", reply_markup=keyboard)
+        await message.answer("✅ Альбом отправлен администраторам.")
+    else:
+        await message.answer("⚠️ Альбом содержит неподдерживаемый тип файлов.")
+
+# ---------------------- Одиночные заявки ----------------------
 @dp.message()
 async def handle_submission(message: Message):
-    """
-    НОВОЕ: не блокируем пользователя сообщением «уже подавали».
-    Если заявка активна — пересылаем всё в админ-чат.
-    Если нет — просим начать через меню оплаты.
-    """
+    if message.chat.type != "private":
+        return
+
     user = message.from_user
     update_user_lang(str(user.id), user.language_code or "unknown")
 
@@ -237,7 +299,6 @@ async def handle_submission(message: Message):
         inline_keyboard=[[InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}")]]
     )
 
-    # Пересылаем контент в админ-чат
     try:
         if message.text:
             await bot.send_message(ADMIN_CHAT_ID, f"{header}\n{message.text}", reply_markup=keyboard)
@@ -255,6 +316,9 @@ async def handle_submission(message: Message):
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback: CallbackQuery):
+    if callback.message.chat.id != ADMIN_CHAT_ID:
+        return  # только админ-чат
+
     if callback.from_user.id not in ADMINS and callback.from_user.id != MAIN_ADMIN_ID:
         await callback.answer("❌ У вас нет прав для отклонения")
         return
@@ -268,25 +332,20 @@ async def reject_request(callback: CallbackQuery):
         print(f"[WARN] Не удалось уведомить пользователя {user_id} об отклонении: {e}")
 
 
-# ---- если бота добавили в чат (защита) ----
 @dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
 async def on_added(event: ChatMemberUpdated):
     chat = event.chat
     if chat.id != ADMIN_CHAT_ID:
         try:
-            await bot.send_message(chat.id, "❌ Этот бот работает только в личных сообщениях и админ-чате.")
             await bot.leave_chat(chat.id)
             print(f"[LOG] Бот автоматически вышел из чата {chat.id}")
         except Exception as e:
             print(f"[ERROR] Не удалось выйти из чата {chat.id}: {e}")
-
 
 # ---------------------- MAIN ----------------------
 async def main():
     print(f"[BOOT] ADMIN_CHAT_ID={ADMIN_CHAT_ID}, MAIN_ADMIN_ID={MAIN_ADMIN_ID}, ADMINS={ADMINS}")
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
