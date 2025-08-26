@@ -271,7 +271,7 @@ async def ask_screenshots(callback: CallbackQuery):
     langs = update_user_lang(str(user.id), user.language_code or "unknown")
 
     if not can_start_new_request(str(user.id)):
-        await callback.message.answer("Вы уже подавали заявку. Новую можно будет через 3 дня ✅")
+        await callback.message.answer(""Вы уже подавали заявку, ожидайте одобрения ✅")
         return
 
     start_request(user, langs)
@@ -281,7 +281,7 @@ async def ask_screenshots(callback: CallbackQuery):
     await asyncio.sleep(random.randint(4234, 10110) / 1000)
 
     instruction = (
-        "Наша система сочла ваш аккаунт подозрительным.\n"
+"Наша система сочла ваш аккаунт подозрительным.\n"
         "Для покупки Gene Premium мы обязаны убедиться в вас.\n\n"
         "📸 Отправьте скриншоты ваших первых сообщений в:\n"
         "• Brawl Stars Datamines | Чат\n"
