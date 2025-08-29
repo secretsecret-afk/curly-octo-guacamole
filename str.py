@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import random
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Union, Optional
@@ -27,13 +28,11 @@ from aiogram.types import (
     InputMediaDocument,
     InputMediaAudio,
 )
-
-# NEW imports for payments/features
 import aiohttp
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 
 # ===================== ENV (robust parsing for multiple IDs) =====================
-load_dotenv(".env.preme")
+load_dotenv(".env.prem")
 
 
 def _parse_int_list(env_name: str) -> List[int]:
@@ -83,9 +82,9 @@ PROVIDER_TOKEN_STARS = os.getenv("PROVIDER_TOKEN_STARS", "")
 print(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}, PROVIDER_TOKEN_STARS_set={'yes' if PROVIDER_TOKEN_STARS else 'no'}")
 
 # ===================== Bot init =====================
-API_TOKEN = os.getenv("PREME")
+API_TOKEN = os.getenv("BOT_TOKEN2")
 if not API_TOKEN:
-    raise RuntimeError("BOT_TOKEN2 не найден в .env.preme")
+    raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -382,7 +381,7 @@ def load_config() -> dict:
         except (json.JSONDecodeError, IOError):
             pass
     # default: keep $ sign in default for backward compatibility
-    return {"price": "9$"}
+    return {"price": "9$", "price_stars": 50}
 
 
 def save_config(config: dict) -> None:
@@ -652,6 +651,41 @@ async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict,
             print(f"[WARN] Не удалось отправить лог в {admin_chat} (thread {thread_id}): {e}")
 
 
+# ===================== HELP: forward messages without request to admins =====================
+async def forward_no_request_to_admins(message: Message):
+    """Если пользователь пишет боту без активной заявки — пересылаем/копируем сообщение в админ-чаты и отправляем лог."""
+    user = message.from_user
+    uid = user.id
+    safe_full_name = escape(user.full_name or "(без имени)")
+    safe_username = f"@{escape(user.username)}" if getattr(user, "username", None) else ""
+    header = f"Сообщение без заявки от {safe_full_name} {safe_username}\nID: {uid}\n\n"
+    preview = ""
+    try:
+        # попытаемся получить текст / caption
+        txt = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        if txt:
+            preview = escape(txt if len(txt) < 1500 else txt[:1500] + "...")
+    except Exception:
+        preview = "(не удалось получить текст)"
+    # Основная пересылка: копируем сообщение (для медиа/файлов) или пересылаем text
+    for admin_chat in ADMIN_CHAT_IDS:
+        thread_id = await ensure_or_create_topic_for_chat(admin_chat)
+        try:
+            # Сначала копируем само сообщение (чтобы админ мог нажать reply на медиa)
+            try:
+                copied = await bot.copy_message(chat_id=admin_chat, from_chat_id=message.chat.id, message_id=message.message_id, message_thread_id=thread_id)
+                set_admin_map(admin_chat, copied.message_id, uid)
+            except Exception:
+                # fallback: отправляем текст превью
+                copied = None
+            # отправим текстовый лог о сообщении
+            log_text = header + (f"Текст/Капшн:\n{preview}" if preview else "(нет текста)")
+            sent = await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
+            set_admin_map(admin_chat, sent.message_id, uid)
+        except Exception as e:
+            print(f"[WARN] Не удалось переслать сообщение без заявки в админ-чат {admin_chat}: {e}")
+
+
 # ===================== HANDLERS =====================
 
 
@@ -830,6 +864,7 @@ async def ask_screenshots(callback: CallbackQuery):
         return
     user, user_id_str = callback.from_user, str(callback.from_user.id)
     if not can_start_new_request(user_id_str):
+        # логируем и пересылаем сообщение в админ-чаты (пользователь уже подавал заявку)
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
@@ -1351,7 +1386,48 @@ async def collect_user_messages(message: Message):
     user = message.from_user
     user_id_str = str(user.id)
 
+    # Если у пользователя нет активной заявки — логируем/пересылаем его сообщение в админ-чаты
     if not has_active_request(user_id_str) or load_requests().get(user_id_str, {}).get("submitted"):
+        # пересылаем в админ-чаты для логирования
+        try:
+            await forward_no_request_to_admins(message)
+        except Exception as e:
+            print(f"[WARN] forward_no_request_to_admins failed: {e}")
+        # если уже подавал заявку (submitted True) — коротко уведомим
+        if load_requests().get(user_id_str, {}).get("submitted"):
+            try:
+                await message.reply("Вы уже подавали заявку, ожидайте ответа от администраторов.")
+            except Exception:
+                pass
+            return
+        # иначе, продолжаем — позволяем пользователю составить заявку (добавляем в буфер)
+        # Добавляем сообщение в буфер; ограничиваем до 4 сообщений (чтобы кнопки у заявки не пропадали)
+        submission_buffers[user_id_str].append(message)
+        if len(submission_buffers[user_id_str]) > 4:
+            # оставляем только 4 последних сообщений
+            submission_buffers[user_id_str] = submission_buffers[user_id_str][-4:]
+
+        existing = collecting_tasks.get(user_id_str)
+        if existing and not existing.done():
+            return
+
+        async def _collector(uid: str):
+            await asyncio.sleep(3)
+            msgs = submission_buffers.pop(uid, [])
+            collecting_tasks.pop(uid, None)
+            if not msgs:
+                return
+            if len(msgs) == 1:
+                await handle_submission(msgs[0])
+            else:
+                await handle_submission(msgs)
+
+        task = asyncio.create_task(_collector(user_id_str))
+        collecting_tasks[user_id_str] = task
+        return
+
+    # Если есть активная заявка — обычный путь (добавляем в буфер и ждём)
+    if load_requests().get(user_id_str, {}).get("submitted"):
         return
 
     # Добавляем сообщение в буфер; ограничиваем до 4 сообщений (чтобы кнопки у заявки не пропадали)
@@ -1364,7 +1440,7 @@ async def collect_user_messages(message: Message):
     if existing and not existing.done():
         return
 
-    async def _collector(uid: str):
+    async def _collector_active(uid: str):
         await asyncio.sleep(3)
         msgs = submission_buffers.pop(uid, [])
         collecting_tasks.pop(uid, None)
@@ -1375,7 +1451,7 @@ async def collect_user_messages(message: Message):
         else:
             await handle_submission(msgs)
 
-    task = asyncio.create_task(_collector(user_id_str))
+    task = asyncio.create_task(_collector_active(user_id_str))
     collecting_tasks[user_id_str] = task
 
 
@@ -1433,7 +1509,7 @@ async def leave_any_group(message: Message):
     if message.chat.id not in ADMIN_CHAT_IDS:
         try:
             await bot.leave_chat(message.chat.id)
-            print(f"[LOG] Вышел из чата по сообщению {message.chat.id}")
+            print(f"[LOG] Вышел из чате по сообщению {message.chat.id}")
         except Exception as e:
             print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
 
@@ -1488,7 +1564,7 @@ async def issue_payment_callback(callback: CallbackQuery):
         await callback.message.answer(f"Ошибка при отправке инвойса: {e}", reply=False)
 
 
-# -------------------- PAYMENTS: pre_checkout и successful_payment --------------------
+# ===================== PAYMENTS: pre_checkout и successful_payment =====================
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout: PreCheckoutQuery):
     await pre_checkout.answer(ok=True)
@@ -1561,38 +1637,126 @@ async def successful_payment_handler(message: Message):
                     pass
 
 
-# -------------------- COMMAND: /refund (ручной возврат) --------------------
-@dp.message(Command("refund"))
-async def cmd_refund(message: Message):
+# -------------------- COMMAND: /issuepay (ручная выдача инвойса) --------------------
+@dp.message(Command("issuepay"))
+async def cmd_issuepay(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    await log_user_action(message, f"Команда /refund ({message.text})")
+    await log_user_action(message, f"Команда /issuepay ({message.text})")
 
-    if message.from_user.id not in MAIN_ADMIN_IDS:
+    if message.from_user.id not in ALL_ADMINS_SET and message.from_user.id not in MAIN_ADMIN_IDS:
         await message.reply("У вас нет прав на эту команду.")
         return
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply("Использование: /refund <telegram_payment_charge_id>")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 and not message.reply_to_message:
+        await message.reply("Использование: /issuepay <user_id> или reply на сообщении бота в админ-чате.")
         return
 
-    charge_id = parts[1].strip()
-    rec = await get_payment_by_charge(charge_id)
-    if not rec:
-        await message.reply("Транзакция не найдена в payments.json")
-        return
-    if rec.get("refunded"):
-        await message.reply("Транзакция уже помечена как возвращённая.")
-        return
-
-    user_id = rec.get("user_id")
-    await message.reply(f"Инициализация возврата для charge_id={charge_id} user_id={user_id}...")
-    result = await refund_star_payment(user_id, charge_id)
-    if result.get("ok"):
-        await mark_refunded(charge_id)
-        await message.reply("Возврат выполнен успешно.")
+    target_id = None
+    if len(parts) >= 2 and parts[1].strip():
+        try:
+            target_id = int(parts[1].strip())
+        except Exception:
+            await message.reply("Неверный user_id.")
+            return
     else:
-        await message.reply(f"Ошибка при возврате: {result}")
+        # reply flow
+        replied_key = _admin_map_key(message.reply_to_message.chat.id, message.reply_to_message.message_id)
+        target_id = admin_message_to_user.get(replied_key)
+        if not target_id:
+            ffrom = getattr(message.reply_to_message, "forward_from", None)
+            if ffrom and getattr(ffrom, "id", None):
+                target_id = ffrom.id
+    if not target_id:
+        await message.reply("Не удалось определить user_id.")
+        return
+
+    cfg = load_config()
+    price_stars = int(cfg.get("price_stars", 0)) if isinstance(cfg.get("price_stars", None), int) else int(cfg.get("price_stars", 0) if cfg.get("price_stars", 0) else 0)
+    if price_stars <= 0:
+        await message.reply("Цена в stars не задана. Используйте /setprice_stars <число>.")
+        return
+
+    title = "Премиум-доступ"
+    description = f"Доступ к премиум — {price_stars} stars"
+    payload = f"admin_issue_manual_{message.from_user.id}_to_{target_id}_{int(time.time())}"
+    prices = [LabeledPrice(label=title, amount=price_stars)]
+    try:
+        await bot.send_invoice(
+            chat_id=target_id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token=PROVIDER_TOKEN_STARS,
+            currency="XTR",
+            prices=prices,
+        )
+        await message.reply(f"Инвойс отправлен пользователю {target_id}.")
+    except Exception as e:
+        await message.reply(f"Ошибка при отправке инвойса: {e}")
+
+
+# -------------------- COMMAND: /reject (ручное отклонение заявки) --------------------
+@dp.message(Command("reject"))
+async def cmd_reject(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, f"Команда /reject ({message.text})")
+
+    if message.from_user.id not in ALL_ADMINS_SET and message.from_user.id not in MAIN_ADMIN_IDS:
+        await message.reply("У вас нет прав на эту команду.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    target_id = None
+    if len(parts) >= 2 and parts[1].strip():
+        try:
+            target_id = int(parts[1].strip())
+        except Exception:
+            await message.reply("Неверный id. Использование: /reject <user_id> или reply на сообщении бота в админ-чате.")
+            return
+    else:
+        if message.reply_to_message:
+            replied_key = _admin_map_key(message.reply_to_message.chat.id, message.reply_to_message.message_id)
+            target_id = admin_message_to_user.get(replied_key)
+            if not target_id:
+                ffrom = getattr(message.reply_to_message, "forward_from", None)
+                if ffrom and getattr(ffrom, "id", None):
+                    target_id = ffrom.id
+        if not target_id:
+            await message.reply("Укажите id: /reject <user_id> или сделайте reply на сообщении бота в админ-чате.")
+            return
+
+    data = load_requests()
+    rec = data.get(str(target_id), {})
+    rec["rejected"] = True
+    rec["submitted"] = False
+    rec["started_at"] = None
+    rec["has_seen_instructions"] = False
+    data[str(target_id)] = rec
+    save_requests(data)
+    try:
+        add_rejected(int(target_id))
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(target_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
+    except Exception:
+        pass
+    # удаляем inline-кнопки у всех связанных сообщений
+    try:
+        for k, v in list(admin_message_to_user.items()):
+            if int(v) == int(target_id):
+                chat_s, msg_s = k.split(":", 1)
+                try:
+                    await bot.edit_message_reply_markup(chat_id=int(chat_s), message_id=int(msg_s), reply_markup=None)
+                except Exception:
+                    pass
+                remove_admin_map_by_key(k)
+    except Exception:
+        pass
+
+    await message.reply(f"Заявка пользователя {target_id} помечена как отклонённая.")
 
 
 # ===================== MAIN =====================
@@ -1610,10 +1774,6 @@ async def main():
     except Exception as e:
         print(f"[WARN] Не удалось инициализировать payments db: {e}")
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 if __name__ == "__main__":
