@@ -10,26 +10,23 @@ from aiogram.filters import Command
 import aiohttp
 from dotenv import load_dotenv
 
- Загружаем переменные из .env.preme
-load_dotenv(".env.preme")
+load_dotenv('.env.preme')
 
-BOT_TOKEN = os.getenv("PREME")
+BOT_TOKEN = os.getenv('PREME')
 if not BOT_TOKEN:
-    raise RuntimeError("PREME env var required in .env.preme")
+    raise RuntimeError('PREME env var required in .env.preme')
 
-DB_FILE = "payments.json"
-
- --- JSON DB (sync helpers run in thread) ---
+DB_FILE = 'payments.json'
 
 def _init_db_sync():
     if not os.path.exists(DB_FILE):
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        with open(DB_FILE, 'w', encoding='utf-8') as f:
             json.dump([], f)
 
 def _read_all_sync() -> List[Dict]:
     if not os.path.exists(DB_FILE):
         return []
-    with open(DB_FILE, "r", encoding="utf-8") as f:
+    with open(DB_FILE, 'r', encoding='utf-8') as f:
         try:
             data = json.load(f)
             if isinstance(data, list):
@@ -39,16 +36,15 @@ def _read_all_sync() -> List[Dict]:
             return []
 
 def _write_all_sync(data: List[Dict]):
-    tmp = DB_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    tmp = DB_FILE + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_FILE)
 
 def _save_payment_sync(record: Dict):
     data = _read_all_sync()
-     avoid duplicates by charge_id
     for r in data:
-        if r.get("charge_id") == record.get("charge_id"):
+        if r.get('charge_id') == record.get('charge_id'):
             return False
     data.append(record)
     _write_all_sync(data)
@@ -58,9 +54,9 @@ def _mark_refunded_sync(charge_id: str) -> bool:
     data = _read_all_sync()
     changed = False
     for r in data:
-        if r.get("charge_id") == charge_id and not r.get("refunded"):
-            r["refunded"] = True
-            r["refunded_at"] = datetime.utcnow().isoformat()
+        if r.get('charge_id') == charge_id and not r.get('refunded'):
+            r['refunded'] = True
+            r['refunded_at'] = datetime.utcnow().isoformat()
             changed = True
     if changed:
         _write_all_sync(data)
@@ -69,24 +65,23 @@ def _mark_refunded_sync(charge_id: str) -> bool:
 def _get_payment_by_charge_sync(charge_id: str) -> Optional[Dict]:
     data = _read_all_sync()
     for r in data:
-        if r.get("charge_id") == charge_id:
+        if r.get('charge_id') == charge_id:
             return r
     return None
 
- async wrappers
 async def init_db():
     await asyncio.to_thread(_init_db_sync)
 
 async def save_payment(user_id: int, charge_id: str, payload: str, amount: int, currency: str):
     record = {
-        "user_id": user_id,
-        "charge_id": charge_id,
-        "payload": payload,
-        "amount": amount,
-        "currency": currency,
-        "refunded": False,
-        "created_at": datetime.utcnow().isoformat(),
-        "refunded_at": None,
+        'user_id': user_id,
+        'charge_id': charge_id,
+        'payload': payload,
+        'amount': amount,
+        'currency': currency,
+        'refunded': False,
+        'created_at': datetime.utcnow().isoformat(),
+        'refunded_at': None,
     }
     return await asyncio.to_thread(_save_payment_sync, record)
 
@@ -96,47 +91,36 @@ async def mark_refunded(charge_id: str) -> bool:
 async def get_payment_by_charge(charge_id: str) -> Optional[Dict]:
     return await asyncio.to_thread(_get_payment_by_charge_sync, charge_id)
 
- --- Telegram / Payments helpers ---
 async def refund_star_payment(user_id: int, telegram_payment_charge_id: str) -> dict:
-    """
-    Вызывает Bot API метод refundStarPayment (async через aiohttp).
-    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/refundStarPayment"
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json={"user_id": user_id, "telegram_payment_charge_id": telegram_payment_charge_id}) as resp:
+        async with session.post(url, json={'user_id': user_id, 'telegram_payment_charge_id': telegram_payment_charge_id}) as resp:
             try:
                 return await resp.json()
             except Exception:
                 text = await resp.text()
-                return {"ok": False, "error": "invalid_json_response", "text": text}
-
- --- Bot handlers ---
+                return {'ok': False, 'error': 'invalid_json_response', 'text': text}
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-@dp.message(Command(commands=["buy"]))
+@dp.message(Command(commands=['buy']))
 async def cmd_buy(message: types.Message):
-    """
-    /buy [amount]
-    По умолчанию 50 (stars)
-    Для XTR prices должен быть ровно 1 элемент.
-    """
     args = message.text.split()
     amount = 50
     if len(args) >= 2:
         try:
             amount = int(args[1])
         except ValueError:
-            await message.reply("Неверная сумма, используйте целое число (количество звёзд).")
+            await message.reply('Неверная сумма, используйте целое число (количество звёзд).')
             return
     if amount <= 0:
-        await message.reply("Сумма должна быть положительной.")
+        await message.reply('Сумма должна быть положительной.')
         return
 
-    title = "Премиум-доступ"
-    description = f"Доступ к премиум на {amount} stars"
-    payload = f"order_{message.from_user.id}_{int(datetime.utcnow().timestamp())}"
+    title = 'Премиум-доступ'
+    description = f'Доступ к премиум на {amount} stars'
+    payload = f'order_{message.from_user.id}_{int(datetime.utcnow().timestamp())}'
 
     prices = [LabeledPrice(label=title, amount=amount)]
 
@@ -146,12 +130,12 @@ async def cmd_buy(message: types.Message):
             title=title,
             description=description,
             payload=payload,
-            provider_token="",
-            currency="XTR",
+            provider_token='',
+            currency='XTR',
             prices=prices,
         )
     except Exception as e:
-        await message.reply(f"Ошибка при отправке инвойса: {e}")
+        await message.reply(f'Ошибка при отправке инвойса: {e}')
 
 @dp.pre_checkout_query()
 async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
@@ -168,31 +152,29 @@ async def successful_payment_handler(message: types.Message):
 
     saved = await save_payment(user_id=user_id, charge_id=charge_id, payload=payload, amount=total_amount, currency=currency)
     if not saved:
-        await message.reply("Транзакция уже существует в базе — пропускаем сохранение.")
+        await message.reply('Транзакция уже существует в базе — пропускаем сохранение.')
 
-    await message.reply("Спасибо за оплату! Проверяем доставку товара...")
+    await message.reply('Спасибо за оплату! Проверяем доставку товара...')
 
-    if payload.startswith("auto_refund"):
-        await message.reply("Требуется авто-возврат по правилам payload — выполняю возврат...")
+    if payload.startswith('auto_refund'):
+        await message.reply('Требуется авто-возврат по правилам payload — выполняю возврат...')
         result = await refund_star_payment(user_id, charge_id)
-        if result.get("ok"):
+        if result.get('ok'):
             await mark_refunded(charge_id)
-            await message.reply("Возврат выполнен успешно.")
+            await message.reply('Возврат выполнен успешно.')
         else:
-            await message.reply(f"Не удалось выполнить возврат: {result}")
+            await message.reply(f'Не удалось выполнить возврат: {result}')
         return
 
-    await message.reply("Доступ выдан — всё готово!")
-
- --- main ---
+    await message.reply('Доступ выдан — всё готово!')
 
 async def main():
     await init_db()
-    print("Бот запущен (polling)...")
+    print('Бот запущен (polling)...')
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Завершение...")
+        print('Завершение...')
