@@ -4,12 +4,13 @@ import json
 from datetime import datetime
 from typing import Optional, List, Dict
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import LabeledPrice, ContentType, PreCheckoutQuery
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import LabeledPrice, PreCheckoutQuery
 from aiogram.filters import Command
 import aiohttp
 from dotenv import load_dotenv
 
+# load .env.preme
 load_dotenv('.env.preme')
 
 BOT_TOKEN = os.getenv('PREME')
@@ -18,6 +19,7 @@ if not BOT_TOKEN:
 
 DB_FILE = 'payments.json'
 
+# Simple JSON-backed storage (thread-safe via to_thread)
 def _init_db_sync():
     if not os.path.exists(DB_FILE):
         with open(DB_FILE, 'w', encoding='utf-8') as f:
@@ -101,9 +103,11 @@ async def refund_star_payment(user_id: int, telegram_payment_charge_id: str) -> 
                 text = await resp.text()
                 return {'ok': False, 'error': 'invalid_json_response', 'text': text}
 
+# Aiogram v3 setup
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Only command: /buy
 @dp.message(Command(commands=['buy']))
 async def cmd_buy(message: types.Message):
     args = message.text.split()
@@ -137,11 +141,13 @@ async def cmd_buy(message: types.Message):
     except Exception as e:
         await message.reply(f'Ошибка при отправке инвойса: {e}')
 
+# Pre-checkout handler (confirm)
 @dp.pre_checkout_query()
-async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
-    await pre_checkout_q.answer(ok=True)
+async def pre_checkout_handler(pre_checkout: PreCheckoutQuery):
+    await pre_checkout.answer(ok=True)
 
-@dp.message(content_types=ContentType.SUCCESSFUL_PAYMENT)
+# Successful payment handler: use F filter to match messages with successful_payment
+@dp.message(F.successful_payment)
 async def successful_payment_handler(message: types.Message):
     sp = message.successful_payment
     user_id = message.from_user.id
@@ -156,7 +162,7 @@ async def successful_payment_handler(message: types.Message):
 
     await message.reply('Спасибо за оплату! Проверяем доставку товара...')
 
-    if payload.startswith('auto_refund'):
+    if payload and payload.startswith('auto_refund'):
         await message.reply('Требуется авто-возврат по правилам payload — выполняю возврат...')
         result = await refund_star_payment(user_id, charge_id)
         if result.get('ok'):
