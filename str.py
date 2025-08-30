@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import random
+import re
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Union, Optional
@@ -18,6 +20,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     FSInputFile,
+    PreCheckoutQuery,
+    LabeledPrice,
 )
 from aiogram.filters import Command, ChatMemberUpdatedFilter, MEMBER
 from aiogram.exceptions import TelegramBadRequest
@@ -93,6 +97,7 @@ BANNED_FILE = "banned.json"
 ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg" -> user_id
 ADMIN_TOPICS_FILE = "admin_topics.json"  # сохраняет маппинг chat_id -> thread_id (созданные темы)
 REJECTED_FILE = "rejected.json"  # сохраняет пользователей, которым отклонили заявку
+TRANSACTIONS_FILE = "transactions.json"  # сохраняет транзакции (ключ — telegram_payment_charge_id)
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
@@ -274,6 +279,44 @@ def remove_admin_map(chat_id: int, msg_id: int) -> None:
     remove_admin_map_by_key(key)
 
 
+# ===================== TRANSACTIONS (stars) — ключ = telegram_payment_charge_id =====================
+
+def load_transactions() -> Dict[str, dict]:
+    if not os.path.exists(TRANSACTIONS_FILE):
+        return {}
+    try:
+        with open(TRANSACTIONS_FILE, "r", encoding="utf-8") as f:
+            txt = f.read().strip()
+            return json.loads(txt) if txt else {}
+    except Exception:
+        print(f"[WARN] {TRANSACTIONS_FILE} повреждён или не читается, создаём новый.")
+        return {}
+
+
+def save_transactions(data: Dict[str, dict]) -> None:
+    try:
+        with open(TRANSACTIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except IOError as e:
+        print(f"[ERROR] Не удалось сохранить {TRANSACTIONS_FILE}: {e}")
+
+
+def record_transaction(tx: dict) -> None:
+    """
+    Сохраняет транзакцию. Если у tx есть telegram_payment_charge_id — используем его как ключ,
+    иначе генерируем временный UUID ключ.
+    """
+    data = load_transactions()
+    key = tx.get("telegram_payment_charge_id") or tx.get("key") or uuid.uuid4().hex
+    data[key] = tx
+    save_transactions(data)
+
+
+def get_transaction_by_charge_id(charge_id: str) -> Optional[dict]:
+    data = load_transactions()
+    return data.get(charge_id)
+
+
 # загрузим маппинг при старте
 try:
     admin_message_to_user = load_admin_map()
@@ -371,7 +414,7 @@ def load_config() -> dict:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             pass
-    # ДОБАВЛЕНО: значение по умолчанию для цены в звездах
+    # defaults: price in $ and price in stars
     return {"price": "9$", "price_stars": 100}
 
 
@@ -585,65 +628,44 @@ async def set_price(message: Message):
         await message.answer("Использование: /setprice 15$")
         return
     new_price = args[1].strip()
+
+    # валидация: только цифры в начале и знак $ в конце: e.g. 10$
+    if not re.match(r'^\d+\$$', new_price):
+        await message.answer("Неверный формат. Цена должна быть вида: 10$")
+        return
+
     cfg = load_config()
     cfg["price"] = new_price
     save_config(cfg)
     await message.answer(f"✅ Цена изменена на {new_price}")
 
-# ===================== STARS FUNCTIONALITY (MERGED) =====================
 
 @dp.message(Command("setprice_stars"))
 async def set_price_stars(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+
+    # логируем попытку изменить цену в звёздах (для аудита)
     await log_user_action(message, f"Команда /setprice_stars ({message.text})")
-    # Разрешено только мейн-админам
+
+    # разрешено только мейн-админам
     if message.from_user.id not in MAIN_ADMIN_IDS:
         return
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2 or not args[1].strip():
-        await message.answer("Использование: /setprice_stars 100")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /setprice_stars 150")
         return
+    val = parts[1].strip()
     try:
-        new_price_stars = int(args[1].strip())
-    except ValueError:
-        await message.answer("Цена должна быть числом.")
+        stars = int(val)
+        if stars <= 0:
+            raise ValueError
+    except Exception:
+        await message.answer("Неверный формат. Введите целое положительное число звёзд, например: /setprice_stars 150")
         return
     cfg = load_config()
-    cfg["price_stars"] = new_price_stars
+    cfg["price_stars"] = stars
     save_config(cfg)
-    await message.answer(f"✅ Цена в звездах изменена на {new_price_stars}")
-
-async def refund_stars(user_id: int, stars: int):
-    # Пример возврата звезд пользователю
-    # В реальной системе здесь будет вызов API Telegram для возврата
-    await log_user_action(None, f"Возврат {stars} звезд пользователю {user_id} после неудачной оплаты")
-    
-    # Сообщаем пользователю о возврате
-    try:
-        await bot.send_message(user_id, f"Вам возвращено {stars} звезд.")
-    except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {user_id} о возврате звезд: {e}")
-
-@dp.message(Command("refund"))
-async def cmd_refund(message: Message):
-    await log_user_action(message, f"Команда /refund ({message.text})")
-    # Разрешено только админам
-    if message.from_user.id not in MAIN_ADMIN_IDS:
-        return
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.answer("Использование: /refund <user_id> [кол-во звезд, необязательно]")
-        return
-    try:
-        user_id = int(parts[1].strip())
-        price_stars = int(parts[2].strip()) if len(parts) > 2 else load_config().get("price_stars", 100)
-    except ValueError:
-        await message.answer("User ID и количество звезд должны быть числами.")
-        return
-
-    await refund_stars(user_id, price_stars)
-    await message.answer(f"Звезды на сумму {price_stars} были возвращены пользователю {user_id}")
-
-# ===================== END STARS FUNCTIONALITY =====================
+    await message.answer(f"✅ Цена в звёздах изменена на {stars} ⭐️")
 
 
 @dp.callback_query(F.data == "premium")
@@ -765,76 +787,6 @@ async def ask_screenshots(callback: CallbackQuery):
             save_requests(data)
     else:
         await callback.message.answer(instruction)
-
-
-# ===================== ADMIN ACTIONS ON SUBMISSIONS =====================
-
-# ДОБАВЛЕНО: обработчик для кнопки "Одобрить"
-@dp.callback_query(F.data.startswith("approve_"))
-async def approve_request(callback: CallbackQuery):
-    await log_user_action(callback, f"Админ {callback.from_user.id} одобрил заявку: {callback.data}")
-    
-    if callback.from_user.id not in ALL_ADMINS_SET:
-        await callback.answer("У вас нет прав для этого действия.", show_alert=True)
-        return
-
-    user_id_str = callback.data.split("_", 1)[1]
-    try:
-        user_id = int(user_id_str)
-    except (ValueError, IndexError):
-        await callback.answer("Ошибка: неверный ID пользователя.", show_alert=True)
-        return
-
-    price_stars = load_config().get("price_stars", 100)
-
-    # Отправляем пользователю сообщение с кнопкой для финальной оплаты
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        # Важно: callback_data здесь отличается от первоначального, чтобы не зациклить логику
-        [InlineKeyboardButton(text=f"Оплатить {price_stars} ⭐️", callback_data="pay_stars_final")],
-    ])
-    
-    try:
-        await bot.send_message(
-            user_id,
-            f"✅ Ваша заявка одобрена! Теперь вы можете произвести оплату.\n\n"
-            f"<b>Доступ к Gene Premium ULTIMATE (навсегда)</b>\nЦена: {price_stars} Telegram Stars.",
-            reply_markup=keyboard
-        )
-        await callback.answer("✅ Заявка одобрена, пользователю отправлена ссылка на оплату.", show_alert=True)
-        # Убираем кнопки у админского сообщения
-        await callback.message.edit_reply_markup(reply_markup=None)
-        # Удаляем заявку из активных
-        remove_request(user_id_str)
-        remove_rejected(user_id) # На случай, если он был в отклоненных ранее
-
-    except Exception as e:
-        await callback.answer(f"⚠️ Не удалось уведомить пользователя {user_id}: {e}", show_alert=True)
-        print(f"[ERROR] Не удалось отправить сообщение об одобрении пользователю {user_id}: {e}")
-
-# ДОБАВЛЕНО: обработчик для финальной оплаты звездами
-@dp.callback_query(F.data == "pay_stars_final")
-async def process_payment_stars(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    price_stars = load_config().get("price_stars", 100)
-
-    await log_user_action(callback, f"Пользователь {user_id} инициировал финальную оплату {price_stars} звезд")
-    
-    # ЗДЕСЬ ДОЛЖНА БЫТЬ ЛОГИКА ВЫСТАВЛЕНИЯ СЧЕТА ЧЕРЕЗ TELEGRAM API
-    # Сейчас это симуляция
-
-    # Проверка на успешную оплату (симуляция)
-    # В реальной системе будет проверка статуса платежа
-    success = random.choice([True, False])
-
-    if success:
-        await bot.send_message(user_id, "✅ Оплата прошла успешно! Доступ к Premium активирован.")
-        await log_user_action(callback, f"Пользователь {user_id} УСПЕШНО оплатил {price_stars} звезд")
-    else:
-        await bot.send_message(user_id, "❌ При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
-        # Возврат звезд
-        await refund_stars(user_id, price_stars)
-
-    await callback.answer() # Убираем "часики" с кнопки
 
 
 @dp.callback_query(F.data.startswith("reject_"))
@@ -1205,15 +1157,11 @@ async def handle_submission(messages: Union[Message, List[Message]]):
         langs = data.get(user_id_str, {}).get("langs", [user.language_code or "неизвестно"])
         safe_langs = ", ".join([escape(str(x)) for x in langs])
         header = f"{safe_full_name} {safe_username}\nID: {user.id}\nЯзыки: {safe_langs}"
-        
-        # ИЗМЕНЕНО: добавлена кнопка "Одобрить"
         admin_keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{user.id}")],
-                [
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}"),
-                    InlineKeyboardButton(text="🔒 Заблокировать", callback_data=f"ban_{user.id}")
-                ],
+                [InlineKeyboardButton(text="✅ Выдать доступ к оплате", callback_data=f"grantpay_{user.id}")],
+                [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{user.id}"),
+                 InlineKeyboardButton(text="🔒 Заблокировать", callback_data=f"ban_{user.id}")],
             ]
         )
 
@@ -1388,6 +1336,262 @@ async def leave_any_group(message: Message):
             print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
 
 
+# ===================== PAYMENT: pre_checkout и successful_payment =====================
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre: PreCheckoutQuery):
+    # При необходимости можно проверять payload/товар; сейчас просто подтверждаем
+    try:
+        await bot.answer_pre_checkout_query(pre.id, ok=True)
+    except Exception as e:
+        print(f"[WARN] Ошибка при подтверждении pre_checkout: {e}")
+
+
+@dp.message(F.successful_payment)
+async def handle_successful_payment(message: Message):
+    """
+    Обработка успешной оплаты Stars.
+    Сохраняем транзакцию КЛЮЧОМ = telegram_payment_charge_id, логируем,
+    затем выполняем автоматический возврат через refundStarPayment и уведомляем пользователя.
+    """
+    sp = message.successful_payment
+    if not sp:
+        return
+
+    invoice_payload = getattr(sp, "invoice_payload", None) or getattr(sp, "payload", None)
+    telegram_charge_id = getattr(sp, "telegram_payment_charge_id", None)
+    total_amount = getattr(sp, "total_amount", None)  # в "малейших единицах" валюты
+    currency = getattr(sp, "currency", None)
+
+    # извлечём user_id из payload (мы отправляли payload = "uid::<user_id>")
+    user_id_from_payload = None
+    if invoice_payload and isinstance(invoice_payload, str) and invoice_payload.startswith("uid::"):
+        try:
+            user_id_from_payload = int(invoice_payload.split("::", 1)[1])
+        except Exception:
+            user_id_from_payload = None
+
+    user_id_for_record = user_id_from_payload or message.chat.id
+
+    # Создаём запись транзакции, ключ — telegram_payment_charge_id
+    if telegram_charge_id:
+        tx = {
+            "telegram_payment_charge_id": telegram_charge_id,
+            "user_id": user_id_for_record,
+            "amount": total_amount,
+            "currency": currency,
+            "status": "paid",
+            "paid_at": _now().isoformat(),
+            "payload": invoice_payload,
+        }
+        record_transaction(tx)
+    else:
+        # чрезвычайный случай — сохраняем с UUID-ключом, но всё равно логируем
+        tx = {
+            "key": uuid.uuid4().hex,
+            "user_id": user_id_for_record,
+            "amount": total_amount,
+            "currency": currency,
+            "status": "paid_no_charge_id",
+            "paid_at": _now().isoformat(),
+            "payload": invoice_payload,
+        }
+        record_transaction(tx)
+
+    # Логирование факта оплаты в лог-теме админ-чатов
+    human_amount = total_amount  # raw value in minimal units
+    log_text = (
+        f"Пользователь оплатил счёт (Stars):\n"
+        f"User ID: {user_id_for_record}\n"
+        f"telegram_payment_charge_id: {telegram_charge_id}\n"
+        f"amount (raw): {human_amount}\n"
+        f"currency: {currency}\n"
+    )
+    for admin_chat in ADMIN_CHAT_IDS:
+        thread_id = get_log_thread_for_chat(admin_chat)
+        try:
+            if thread_id is not None:
+                await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
+            else:
+                await bot.send_message(chat_id=admin_chat, text=log_text)
+        except Exception as e:
+            print(f"[WARN] Не удалось отправить лог об оплате в {admin_chat} (thread {thread_id}): {e}")
+
+    # Автовозврат: вызываем refundStarPayment по telegram_payment_charge_id
+    if telegram_charge_id:
+        try:
+            res = await bot.request("refundStarPayment", {"telegram_payment_charge_id": telegram_charge_id})
+            # обновим запись
+            tx_update = get_transaction_by_charge_id(telegram_charge_id) or {}
+            tx_update["status"] = "refunded_auto"
+            tx_update["refunded_at"] = _now().isoformat()
+            tx_update["refund_result"] = res
+            record_transaction(tx_update)
+
+            # уведомление пользователя
+            try:
+                await bot.send_message(chat_id=user_id_for_record, text="⚠️ При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
+            except Exception as e:
+                print(f"[WARN] Не удалось уведомить пользователя о возврате: {e}")
+
+            # лог возврата в теме
+            log_refund = (
+                f"Автовозврат выполнен:\nUser ID: {user_id_for_record}\ntelegram_payment_charge_id: {telegram_charge_id}\namount (raw): {human_amount}\n"
+            )
+            for admin_chat in ADMIN_CHAT_IDS:
+                thread_id = get_log_thread_for_chat(admin_chat)
+                try:
+                    if thread_id is not None:
+                        await bot.send_message(chat_id=admin_chat, text=log_refund, message_thread_id=thread_id)
+                    else:
+                        await bot.send_message(chat_id=admin_chat, text=log_refund)
+                except Exception as e:
+                    print(f"[WARN] Не удалось отправить лог автовореза в {admin_chat} (thread {thread_id}): {e}")
+
+        except Exception as e:
+            print(f"[ERROR] Ошибка при автоворезе refundStarPayment: {e}")
+            tx_update = get_transaction_by_charge_id(telegram_charge_id) or {}
+            tx_update["refund_error"] = str(e)
+            record_transaction(tx_update)
+
+
+# ------------------ CALLBACK: выдать доступ к оплате (создание invoice для XTR) ------------------
+@dp.callback_query(F.data.startswith("grantpay_"))
+async def grant_payment_access(callback: CallbackQuery):
+    """
+    Админ нажал 'выдать доступ к оплате' — отправляем пользователю invoice (Stars, currency=XTR).
+    payload = "uid::<user_id>" чтобы связать оплату с пользователем при успешной оплате.
+    Транзакция окончательно сохранится после successful_payment (ключ — telegram_payment_charge_id).
+    """
+    update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
+
+    if callback.message.chat.id not in ADMIN_CHAT_IDS:
+        await callback.answer("⚠️ Эта кнопка доступна только в админ-чатах.", show_alert=True)
+        return
+    if callback.from_user.id not in ALL_ADMINS_SET:
+        await callback.answer("⚠️ У вас нет прав.", show_alert=True)
+        return
+
+    await callback.answer()  # убираем крутилку
+
+    user_id_str = callback.data.split("_", 1)[1]
+    try:
+        uid = int(user_id_str)
+    except Exception:
+        await callback.message.answer("Неверный user id в callback.")
+        return
+
+    cfg = load_config()
+    stars_price = int(cfg.get("price_stars", 100))
+
+    # уведомляем пользователя о начале
+    try:
+        await bot.send_message(chat_id=uid, text="✅ Ваша заявка одобрена! Генерирую оплату....")
+    except Exception as e:
+        print(f"[WARN] Не удалось уведомить пользователя {uid} об одобрении: {e}")
+
+    # формируем LabeledPrice — amount в минимальных единицах
+    amount_for_invoice = stars_price  # <-- при необходимости умножь на 100: stars_price * 100
+    price = [LabeledPrice(label="Доступ к Gene Premium ULTIMATE (1 мес)", amount=amount_for_invoice)]
+
+    try:
+        # отправляем инвойс с provider_token пустым (для XTR) и currency XTR
+        # payload содержит наш user id, чтобы связать оплату при successful_payment
+        invoice_msg = await bot.send_invoice(
+            chat_id=uid,
+            title="Доступ к Gene Premium ULTIMATE",
+            description="На 1 месяц.",
+            payload=f"uid::{uid}",
+            provider_token="",
+            currency="XTR",
+            prices=price,
+        )
+        # Отправка invoice успешно — можно опционально логировать факт отправки invoice в admin chat
+        for admin_chat in ADMIN_CHAT_IDS:
+            try:
+                thread_id = get_thread_for_chat(admin_chat)
+                text = f"Инвойс отправлен пользователю {uid} на {stars_price} ⭐️."
+                log_thread = get_log_thread_for_chat(admin_chat)
+                if log_thread is not None:
+                    await bot.send_message(chat_id=admin_chat, text=text, message_thread_id=log_thread)
+                else:
+                    await bot.send_message(chat_id=admin_chat, text=text)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[ERROR] Не удалось отправить инвойс пользователю {uid}: {e}")
+        try:
+            await callback.message.answer(f"Ошибка при отправке инвойса пользователю {uid}: {e}")
+        except Exception:
+            pass
+        return
+
+    try:
+        await callback.message.answer(f"Инвойс отправлен пользователю {uid} ({stars_price}⭐️).")
+    except Exception:
+        pass
+
+
+# ===================== /refund <telegram_payment_charge_id> (админская команда) =====================
+@dp.message(Command("refund"))
+async def cmd_refund(message: Message):
+    """
+    /refund <telegram_payment_charge_id>  -> вернуть звёзды по id операции, который дал Telegram
+    Доступно только для админов.
+    """
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, f"Команда /refund ({message.text})")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("Использование: /refund <telegram_payment_charge_id>")
+        return
+
+    charge_id = parts[1].strip()
+    tx = get_transaction_by_charge_id(charge_id)
+    if not tx:
+        await message.reply("Транзакция не найдена по этому telegram_payment_charge_id.")
+        return
+
+    # Если уже возвращена
+    if tx.get("status", "").startswith("refunded"):
+        await message.reply(f"Транзакция уже возвращена. Статус: {tx.get('status')}")
+        return
+
+    # Выполняем refundStarPayment
+    try:
+        res = await bot.request("refundStarPayment", {"telegram_payment_charge_id": charge_id})
+        tx["status"] = "refunded_manual"
+        tx["refunded_at"] = _now().isoformat()
+        tx["refund_result_manual"] = res
+        # перезапишем запись ключом = charge_id
+        record_transaction(tx)
+        # уведомляем пользователя
+        try:
+            await bot.send_message(chat_id=tx.get("user_id"), text=f"⭐️ Ваш платёж (id {charge_id}) возвращён администратором.")
+        except Exception as e:
+            print(f"[WARN] Не удалось уведомить пользователя о возврате: {e}")
+
+        await message.reply(f"✅ Возврат выполнен для {charge_id}.")
+        # логируем в лог-теме
+        log_text = f"Ручной возврат: telegram_charge {charge_id}, user {tx.get('user_id')}, выполнен админом: {message.from_user.id}"
+        for admin_chat in ADMIN_CHAT_IDS:
+            thread_id = get_log_thread_for_chat(admin_chat)
+            try:
+                if thread_id is not None:
+                    await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
+                else:
+                    await bot.send_message(chat_id=admin_chat, text=log_text)
+            except Exception as e:
+                print(f"[WARN] Не удалось сохранить лог возврата в {admin_chat} (thread {thread_id}): {e}")
+    except Exception as e:
+        await message.reply(f"Ошибка при попытке вернуть: {e}")
+        print(f"[ERROR] Ошибка refundStarPayment (manual): {e}")
+
+
 # ===================== MAIN =====================
 async def main():
     print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
@@ -1397,7 +1601,6 @@ async def main():
             await ensure_or_create_topic_for_chat(admin_chat)
         except Exception:
             pass
-    print(f"[BOOT] Бот запускается...")
     await dp.start_polling(bot)
 
 
