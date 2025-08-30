@@ -1,3 +1,6 @@
+# << весь код, который ты дал, с теми же import/структурами >>
+# Ниже вставлен полный обновлённый файл (смотри отличия в комментариях)
+
 import os
 import json
 import asyncio
@@ -313,8 +316,21 @@ def record_transaction(tx: dict) -> None:
 
 
 def get_transaction_by_charge_id(charge_id: str) -> Optional[dict]:
+    """
+    Ищем транзакцию: сначала по ключу (charge_id), если нет — пробегаем по всем записям
+    и ищем запись, где поле 'telegram_payment_charge_id' == charge_id.
+    """
     data = load_transactions()
-    return data.get(charge_id)
+    if charge_id in data:
+        return data[charge_id]
+    # fallback: искать в значениях
+    for k, v in data.items():
+        try:
+            if v.get("telegram_payment_charge_id") == charge_id:
+                return v
+        except Exception:
+            continue
+    return None
 
 
 # загрузим маппинг при старте
@@ -1407,6 +1423,7 @@ async def handle_successful_payment(message: Message):
         f"amount (raw): {human_amount}\n"
         f"currency: {currency}\n"
     )
+    print("[PAYMENT] " + log_text)  # stdout для отладки
     for admin_chat in ADMIN_CHAT_IDS:
         thread_id = get_log_thread_for_chat(admin_chat)
         try:
@@ -1417,10 +1434,11 @@ async def handle_successful_payment(message: Message):
         except Exception as e:
             print(f"[WARN] Не удалось отправить лог об оплате в {admin_chat} (thread {thread_id}): {e}")
 
-    # Автовозврат: вызываем refundStarPayment по telegram_payment_charge_id
+    # Автовозврат: вызываем refundStarPayment по telegram_payment_charge_id и user_id (требуется оба параметра)
     if telegram_charge_id:
         try:
-            res = await bot.request("refundStarPayment", {"telegram_payment_charge_id": telegram_charge_id})
+            # IMPORTANT: Telegram requires both user_id and telegram_payment_charge_id
+            res = await bot.request("refundStarPayment", {"user_id": user_id_for_record, "telegram_payment_charge_id": telegram_charge_id})
             # обновим запись
             tx_update = get_transaction_by_charge_id(telegram_charge_id) or {}
             tx_update["status"] = "refunded_auto"
@@ -1537,6 +1555,7 @@ async def grant_payment_access(callback: CallbackQuery):
 async def cmd_refund(message: Message):
     """
     /refund <telegram_payment_charge_id>  -> вернуть звёзды по id операции, который дал Telegram
+    Можно также: /refund <telegram_payment_charge_id> <user_id> (если транзакция не найдена в локальном файле)
     Доступно только для админов.
     """
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
@@ -1545,39 +1564,52 @@ async def cmd_refund(message: Message):
     if message.from_user.id not in ALL_ADMINS_SET:
         return
 
-    parts = message.text.split(maxsplit=1)
+    parts = message.text.split(maxsplit=2)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("Использование: /refund <telegram_payment_charge_id>")
+        await message.reply("Использование: /refund <telegram_payment_charge_id> [user_id]")
         return
 
     charge_id = parts[1].strip()
+    provided_user_id = None
+    if len(parts) >= 3 and parts[2].strip():
+        try:
+            provided_user_id = int(parts[2].strip())
+        except Exception:
+            provided_user_id = None
+
     tx = get_transaction_by_charge_id(charge_id)
-    if not tx:
-        await message.reply("Транзакция не найдена по этому telegram_payment_charge_id.")
+    if not tx and provided_user_id is None:
+        await message.reply("Транзакция не найдена в локальной базе. Повторите команду как: /refund <charge_id> <user_id>")
+        return
+
+    # определяем user_id для возврата
+    user_id_for_refund = provided_user_id or (tx.get("user_id") if tx else None)
+    if not user_id_for_refund:
+        await message.reply("Не удалось определить user_id для возврата. Укажите его вторым аргументом: /refund <charge_id> <user_id>")
         return
 
     # Если уже возвращена
-    if tx.get("status", "").startswith("refunded"):
+    if tx and tx.get("status", "").startswith("refunded"):
         await message.reply(f"Транзакция уже возвращена. Статус: {tx.get('status')}")
         return
 
     # Выполняем refundStarPayment
     try:
-        res = await bot.request("refundStarPayment", {"telegram_payment_charge_id": charge_id})
-        tx["status"] = "refunded_manual"
-        tx["refunded_at"] = _now().isoformat()
-        tx["refund_result_manual"] = res
-        # перезапишем запись ключом = charge_id
-        record_transaction(tx)
+        res = await bot.request("refundStarPayment", {"user_id": int(user_id_for_refund), "telegram_payment_charge_id": charge_id})
+        tx2 = tx or {"telegram_payment_charge_id": charge_id, "user_id": user_id_for_refund, "amount": None, "currency": None}
+        tx2["status"] = "refunded_manual"
+        tx2["refunded_at"] = _now().isoformat()
+        tx2["refund_result_manual"] = res
+        record_transaction(tx2)
         # уведомляем пользователя
         try:
-            await bot.send_message(chat_id=tx.get("user_id"), text=f"⭐️ Ваш платёж (id {charge_id}) возвращён администратором.")
+            await bot.send_message(chat_id=user_id_for_refund, text=f"⭐️ Ваш платёж (id {charge_id}) возвращён администратором.")
         except Exception as e:
             print(f"[WARN] Не удалось уведомить пользователя о возврате: {e}")
 
         await message.reply(f"✅ Возврат выполнен для {charge_id}.")
         # логируем в лог-теме
-        log_text = f"Ручной возврат: telegram_charge {charge_id}, user {tx.get('user_id')}, выполнен админом: {message.from_user.id}"
+        log_text = f"Ручной возврат: telegram_charge {charge_id}, user {user_id_for_refund}, выполнен админом: {message.from_user.id}"
         for admin_chat in ADMIN_CHAT_IDS:
             thread_id = get_log_thread_for_chat(admin_chat)
             try:
