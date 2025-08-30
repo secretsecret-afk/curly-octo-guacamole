@@ -1,17 +1,16 @@
-# << весь код, который ты дал, с теми же import/структурами >>
-# Ниже вставлен полный обновлённый файл (смотри отличия в комментариях)
-
 import os
 import json
 import asyncio
 import random
 import re
 import uuid
+import logging
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Union, Optional
 from html import escape
 
+import aiohttp
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -34,6 +33,17 @@ from aiogram.types import (
     InputMediaDocument,
     InputMediaAudio,
 )
+
+# ===================== DEBUG LOGGING =====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot_debug.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
 
 # ===================== ENV (robust parsing for multiple IDs) =====================
 load_dotenv(".env.prem")
@@ -80,11 +90,12 @@ if ADMIN_THREAD_NAMES_RAW:
 # Combined admin sets for permission checks
 ALL_ADMINS_SET = set(ADMINS) | set(MAIN_ADMIN_IDS)
 
-print(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+logger.info(f"[ENV] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
 
 # ===================== Bot init =====================
 API_TOKEN = os.getenv("BOT_TOKEN2")
 if not API_TOKEN:
+    logger.error("BOT_TOKEN2 не найден в .env.prem")
     raise RuntimeError("BOT_TOKEN2 не найден в .env.prem")
 
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -100,7 +111,7 @@ BANNED_FILE = "banned.json"
 ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg" -> user_id
 ADMIN_TOPICS_FILE = "admin_topics.json"  # сохраняет маппинг chat_id -> thread_id (созданные темы)
 REJECTED_FILE = "rejected.json"  # сохраняет пользователей, которым отклонили заявку
-TRANSACTIONS_FILE = "transactions.json"  # сохраняет транзакции (ключ — telegram_payment_charge_id)
+TRANSACTIONS_FILE = "transactions.json"  # сохраняет транзакции (list of records)
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
@@ -130,7 +141,7 @@ def load_requests() -> Dict[str, dict]:
             txt = f.read().strip()
             return json.loads(txt) if txt else {}
     except (json.JSONDecodeError, IOError):
-        print(f"[WARN] {REQUESTS_FILE} поврежден или не читается, создаем новый.")
+        logger.warning(f"{REQUESTS_FILE} поврежден или не читается, создаем новый.")
         return {}
 
 
@@ -139,7 +150,7 @@ def save_requests(data: Dict[str, dict]) -> None:
         with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except IOError as e:
-        print(f"[ERROR] Не удалось сохранить {REQUESTS_FILE}: {e}")
+        logger.error(f"Не удалось сохранить {REQUESTS_FILE}: {e}")
 
 
 def load_banned() -> List[int]:
@@ -158,7 +169,7 @@ def save_banned(b: List[int]) -> None:
         with open(BANNED_FILE, "w", encoding="utf-8") as f:
             json.dump(b, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить {BANNED_FILE}: {e}")
+        logger.warning(f"Не удалось сохранить {BANNED_FILE}: {e}")
 
 
 def ban_user_by_id(uid: int) -> None:
@@ -199,7 +210,7 @@ def save_admin_map(m: Dict[str, int]) -> None:
         with open(ADMIN_MAP_FILE, "w", encoding="utf-8") as f:
             json.dump(m, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить {ADMIN_MAP_FILE}: {e}")
+        logger.warning(f"Не удалось сохранить {ADMIN_MAP_FILE}: {e}")
 
 
 def load_admin_topics() -> Dict[str, int]:
@@ -218,7 +229,7 @@ def save_admin_topics(m: Dict[str, int]) -> None:
         with open(ADMIN_TOPICS_FILE, "w", encoding="utf-8") as f:
             json.dump(m, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить {ADMIN_TOPICS_FILE}: {e}")
+        logger.warning(f"Не удалось сохранить {ADMIN_TOPICS_FILE}: {e}")
 
 
 def load_rejected() -> set:
@@ -237,7 +248,7 @@ def save_rejected(s: set) -> None:
         with open(REJECTED_FILE, "w", encoding="utf-8") as f:
             json.dump(list(s), f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить {REJECTED_FILE}: {e}")
+        logger.warning(f"Не удалось сохранить {REJECTED_FILE}: {e}")
 
 
 def add_rejected(uid: int) -> None:
@@ -282,55 +293,105 @@ def remove_admin_map(chat_id: int, msg_id: int) -> None:
     remove_admin_map_by_key(key)
 
 
-# ===================== TRANSACTIONS (stars) — ключ = telegram_payment_charge_id =====================
+# ===================== TRANSACTIONS storage (safe sync file ops) =====================
 
-def load_transactions() -> Dict[str, dict]:
+def _init_transactions_sync():
     if not os.path.exists(TRANSACTIONS_FILE):
-        return {}
-    try:
-        with open(TRANSACTIONS_FILE, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-            return json.loads(txt) if txt else {}
-    except Exception:
-        print(f"[WARN] {TRANSACTIONS_FILE} повреждён или не читается, создаём новый.")
-        return {}
-
-
-def save_transactions(data: Dict[str, dict]) -> None:
-    try:
         with open(TRANSACTIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except IOError as e:
-        print(f"[ERROR] Не удалось сохранить {TRANSACTIONS_FILE}: {e}")
+            json.dump([], f)
 
 
-def record_transaction(tx: dict) -> None:
-    """
-    Сохраняет транзакцию. Если у tx есть telegram_payment_charge_id — используем его как ключ,
-    иначе генерируем временный UUID ключ.
-    """
-    data = load_transactions()
-    key = tx.get("telegram_payment_charge_id") or tx.get("key") or uuid.uuid4().hex
-    data[key] = tx
-    save_transactions(data)
-
-
-def get_transaction_by_charge_id(charge_id: str) -> Optional[dict]:
-    """
-    Ищем транзакцию: сначала по ключу (charge_id), если нет — пробегаем по всем записям
-    и ищем запись, где поле 'telegram_payment_charge_id' == charge_id.
-    """
-    data = load_transactions()
-    if charge_id in data:
-        return data[charge_id]
-    # fallback: искать в значениях
-    for k, v in data.items():
+def _read_all_transactions_sync() -> List[Dict]:
+    if not os.path.exists(TRANSACTIONS_FILE):
+        return []
+    with open(TRANSACTIONS_FILE, "r", encoding="utf-8") as f:
         try:
-            if v.get("telegram_payment_charge_id") == charge_id:
-                return v
+            data = json.load(f)
+            return data if isinstance(data, list) else []
         except Exception:
-            continue
+            return []
+
+
+def _write_all_transactions_sync(data: List[Dict]):
+    tmp = TRANSACTIONS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, TRANSACTIONS_FILE)
+
+
+def _save_transaction_sync(record: Dict):
+    data = _read_all_transactions_sync()
+    # если уже есть транзакция с таким charge_id — не дублируем
+    if record.get("telegram_payment_charge_id"):
+        for r in data:
+            if r.get("telegram_payment_charge_id") == record.get("telegram_payment_charge_id"):
+                return False
+    data.append(record)
+    _write_all_transactions_sync(data)
+    return True
+
+
+def _mark_transaction_refunded_sync(charge_id: str) -> bool:
+    data = _read_all_transactions_sync()
+    changed = False
+    for r in data:
+        if r.get("telegram_payment_charge_id") == charge_id and not r.get("refunded"):
+            r["refunded"] = True
+            r["refunded_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+    if changed:
+        _write_all_transactions_sync(data)
+    return changed
+
+
+def _get_transaction_by_charge_sync(charge_id: str) -> Optional[Dict]:
+    data = _read_all_transactions_sync()
+    for r in data:
+        if r.get("telegram_payment_charge_id") == charge_id:
+            return r
     return None
+
+
+async def init_transactions():
+    await asyncio.to_thread(_init_transactions_sync)
+
+
+async def save_transaction(user_id: int, charge_id: str, payload: str, amount: int, currency: str):
+    record = {
+        "user_id": user_id,
+        "telegram_payment_charge_id": charge_id,
+        "payload": payload,
+        "amount": amount,
+        "currency": currency,
+        "refunded": False,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "refunded_at": None,
+    }
+    return await asyncio.to_thread(_save_transaction_sync, record)
+
+
+async def mark_transaction_refunded(charge_id: str) -> bool:
+    return await asyncio.to_thread(_mark_transaction_refunded_sync, charge_id)
+
+
+async def get_transaction_by_charge(charge_id: str) -> Optional[Dict]:
+    return await asyncio.to_thread(_get_transaction_by_charge_sync, charge_id)
+
+
+# ---- Telegram API refund call (логируем тело ответа) ----
+async def refund_star_payment(user_id: int, telegram_payment_charge_id: str) -> dict:
+    url = f"https://api.telegram.org/bot{API_TOKEN}/refundStarPayment"
+    payload = {"user_id": user_id, "telegram_payment_charge_id": telegram_payment_charge_id}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            text = await resp.text()
+            try:
+                js = json.loads(text)
+            except Exception:
+                js = {"ok": False, "error": "invalid_json", "text": text}
+            logger.info(f"refundStarPayment response for {telegram_payment_charge_id}: {js}")
+            print("refundStarPayment response:", js)
+            return js
 
 
 # загрузим маппинг при старте
@@ -447,9 +508,9 @@ async def ensure_private_and_autoleave(message: Message) -> bool:
         if message.chat.id not in ADMIN_CHAT_IDS:
             try:
                 await bot.leave_chat(message.chat.id)
-                print(f"[LOG] Вышел из чата {message.chat.id}")
+                logger.info(f"[LOG] Вышел из чата {message.chat.id}")
             except Exception as e:
-                print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
+                logger.error(f"Не удалось выйти из чата {message.chat.id}: {e}")
         return False
     return True
 
@@ -539,10 +600,10 @@ async def ensure_or_create_topic_for_chat(chat_id: int) -> Optional[int]:
                 if thread_id:
                     admin_topics_map[key] = int(thread_id)
                     save_admin_topics(admin_topics_map)
-                    print(f"[INFO] Создана тема '{name}' в чате {chat_id} -> thread {thread_id}")
+                    logger.info(f"[INFO] Создана тема '{name}' в чате {chat_id} -> thread {thread_id}")
                     return int(thread_id)
             except Exception as e:
-                print(f"[WARN] Не удалось создать тему '{name}' в чате {chat_id}: {e}")
+                logger.warning(f"Не удалось создать тему '{name}' в чате {chat_id}: {e}")
                 return None
     return None
 
@@ -589,7 +650,7 @@ async def log_user_action(user_obj: Union[Message, CallbackQuery, Message, dict,
                 await bot.send_message(chat_id=admin_chat, text=text)
         except Exception as e:
             # не фатально, логируем на stdout
-            print(f"[WARN] Не удалось отправить лог в {admin_chat} (thread {thread_id}): {e}")
+            logger.warning(f"Не удалось отправить лог в {admin_chat} (thread {thread_id}): {e}")
 
 
 # ===================== HANDLERS =====================
@@ -623,7 +684,7 @@ async def send_welcome(message: Message):
         try:
             await message.answer_photo(photo=FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=keyboard)
         except Exception as e:
-            print(f"[WARN] Не удалось отправить локальную картинку: {e}")
+            logger.warning(f"Не удалось отправить локальную картинку: {e}")
             await message.answer(caption, reply_markup=keyboard)
     else:
         await message.answer(caption, reply_markup=keyboard)
@@ -840,7 +901,7 @@ async def reject_request(callback: CallbackQuery):
     try:
         await bot.send_message(user_id, "❌ Ваша заявка отклонена.\nВы можете попробовать подать её снова.")
     except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {user_id}: {e}")
+        logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -878,7 +939,7 @@ async def ban_request(callback: CallbackQuery):
             except Exception:
                 pass
     except Exception as e:
-        print(f"[WARN] Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
+        logger.warning(f"Не удалось полностью заблокировать/очистить данные для {uid}: {e}")
 
     try:
         add_rejected(uid)
@@ -888,7 +949,7 @@ async def ban_request(callback: CallbackQuery):
     try:
         await bot.send_message(uid, "🔒 Вы были заблокированы.")
     except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {uid}: {e}")
+        logger.warning(f"Не удалось уведомить пользователя {uid}: {e}")
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -970,7 +1031,7 @@ async def cmd_ban(message: Message):
             except Exception:
                 continue
     except Exception as e:
-        print(f"[WARN] Ошибка при очистке админских сообщений для {target_id}: {e}")
+        logger.warning(f"Ошибка при очистке админских сообщений для {target_id}: {e}")
 
     try:
         add_rejected(int(target_id))
@@ -1230,10 +1291,10 @@ async def handle_submission(messages: Union[Message, List[Message]]):
             mark_submitted(user_id_str)
 
         except TelegramBadRequest as e:
-            print(f"[BAD_REQUEST] {e!r}")
+            logger.warning(f"[BAD_REQUEST] {e!r}")
             await first_message.answer("⚠️ Не удалось отправить заявку. Попробуйте ещё раз .")
         except Exception as e:
-            print(f"[ERROR] Не удалось отправить в админ-чат: {e}")
+            logger.error(f"[ERROR] Не удалось отправить в админ-чат: {e}")
             await first_message.answer("⚠️ Не удалось отправить заявку.\nПопробуйте ещё раз позже.")
 
 
@@ -1324,10 +1385,10 @@ async def admin_reply_handler(message: Message):
         await bot.copy_message(chat_id=target_user_id, from_chat_id=message.chat.id, message_id=message.message_id)
         await message.reply("✅ Ответ отправлен пользователю.", quote=False)
     except TelegramBadRequest as e:
-        print(f"[WARN] Не удалось отправить ответ пользователю {target_user_id}: {e}")
+        logger.warning(f"Не удалось отправить ответ пользователю {target_user_id}: {e}")
         await message.reply("⚠️ Не удалось отправить ответ пользователю.", quote=False)
     except Exception as e:
-        print(f"[ERROR] Ошибка при пересылке ответа пользователю: {e}")
+        logger.error(f"Ошибка при пересылке ответа пользователю: {e}")
         await message.reply("⚠️ Ошибка при пересылке ответа пользователю.", quote=False)
 
 
@@ -1337,9 +1398,9 @@ async def on_added(event: ChatMemberUpdated):
     if event.chat.id not in ADMIN_CHAT_IDS:
         try:
             await bot.leave_chat(event.chat.id)
-            print(f"[LOG] Автовыход из чата {event.chat.id}")
+            logger.info(f"[LOG] Автовыход из чата {event.chat.id}")
         except Exception as e:
-            print(f"[ERROR] Не удалось выйти из чата {event.chat.id}: {e}")
+            logger.error(f"Не удалось выйти из чата {event.chat.id}: {e}")
 
 
 @dp.message(F.chat.type.in_(["group", "supergroup", "channel"]))
@@ -1347,83 +1408,76 @@ async def leave_any_group(message: Message):
     if message.chat.id not in ADMIN_CHAT_IDS:
         try:
             await bot.leave_chat(message.chat.id)
-            print(f"[LOG] Вышел из чата по сообщению {message.chat.id}")
+            logger.info(f"[LOG] Вышел из чата по сообщению {message.chat.id}")
         except Exception as e:
-            print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
+            logger.error(f"Не удалось выйти из чата {message.chat.id}: {e}")
 
 
 # ===================== PAYMENT: pre_checkout и successful_payment =====================
 
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre: PreCheckoutQuery):
-    # При необходимости можно проверять payload/товар; сейчас просто подтверждаем
     try:
         await bot.answer_pre_checkout_query(pre.id, ok=True)
     except Exception as e:
-        print(f"[WARN] Ошибка при подтверждении pre_checkout: {e}")
+        logger.warning(f"Ошибка при подтверждении pre_checkout: {e}")
 
 
 @dp.message(F.successful_payment)
 async def handle_successful_payment(message: Message):
     """
     Обработка успешной оплаты Stars.
-    Сохраняем транзакцию КЛЮЧОМ = telegram_payment_charge_id, логируем,
-    затем выполняем автоматический возврат через refundStarPayment и уведомляем пользователя.
+    Сохраняем транзакцию, логируем, затем выполняем автоматический возврат через refundStarPayment
+    и уведомляем пользователя.
     """
+    logger.info("successful_payment handler triggered")
     sp = message.successful_payment
     if not sp:
+        logger.warning("No successful_payment payload found")
         return
 
-    invoice_payload = getattr(sp, "invoice_payload", None) or getattr(sp, "payload", None)
+    invoice_payload = getattr(sp, "invoice_payload", None) or getattr(sp, "payload", None) or ""
     telegram_charge_id = getattr(sp, "telegram_payment_charge_id", None)
-    total_amount = getattr(sp, "total_amount", None)  # в "малейших единицах" валюты
+    total_amount = getattr(sp, "total_amount", None)  # в минимальных единицах XTR
     currency = getattr(sp, "currency", None)
+    user_id = message.from_user.id
 
-    # извлечём user_id из payload (мы отправляли payload = "uid::<user_id>")
-    user_id_from_payload = None
-    if invoice_payload and isinstance(invoice_payload, str) and invoice_payload.startswith("uid::"):
-        try:
-            user_id_from_payload = int(invoice_payload.split("::", 1)[1])
-        except Exception:
-            user_id_from_payload = None
+    logger.info(f"Payment received: user={user_id} charge_id={telegram_charge_id} amount={total_amount} currency={currency} payload={invoice_payload}")
+    print(f"[PAYMENT] user={user_id} charge={telegram_charge_id} amount={total_amount} payload={invoice_payload}")
 
-    user_id_for_record = user_id_from_payload or message.chat.id
+    # сохраняем транзакцию
+    try:
+        if telegram_charge_id:
+            saved = await save_transaction(user_id=user_id, charge_id=telegram_charge_id, payload=invoice_payload, amount=total_amount, currency=currency)
+            if not saved:
+                logger.info(f"Transaction {telegram_charge_id} already exists in {TRANSACTIONS_FILE}")
+        else:
+            # создаём временную запись с UUID key
+            tmp_key = uuid.uuid4().hex
+            await asyncio.to_thread(_save_transaction_sync, {
+                "user_id": user_id,
+                "telegram_payment_charge_id": tmp_key,
+                "payload": invoice_payload,
+                "amount": total_amount,
+                "currency": currency,
+                "refunded": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "refunded_at": None,
+            })
+            logger.warning("Payment had no telegram_payment_charge_id — stored with tmp key")
+    except Exception as e:
+        logger.error(f"Error saving transaction: {e}")
 
-    # Создаём запись транзакции, ключ — telegram_payment_charge_id
-    if telegram_charge_id:
-        tx = {
-            "telegram_payment_charge_id": telegram_charge_id,
-            "user_id": user_id_for_record,
-            "amount": total_amount,
-            "currency": currency,
-            "status": "paid",
-            "paid_at": _now().isoformat(),
-            "payload": invoice_payload,
-        }
-        record_transaction(tx)
-    else:
-        # чрезвычайный случай — сохраняем с UUID-ключом, но всё равно логируем
-        tx = {
-            "key": uuid.uuid4().hex,
-            "user_id": user_id_for_record,
-            "amount": total_amount,
-            "currency": currency,
-            "status": "paid_no_charge_id",
-            "paid_at": _now().isoformat(),
-            "payload": invoice_payload,
-        }
-        record_transaction(tx)
-
-    # Логирование факта оплаты в лог-теме админ-чатов
-    human_amount = total_amount  # raw value in minimal units
+    # логируем факт оплаты в лог-теме админ-чатов
+    human_amount = total_amount
     log_text = (
         f"Пользователь оплатил счёт (Stars):\n"
-        f"User ID: {user_id_for_record}\n"
+        f"User ID: {user_id}\n"
         f"telegram_payment_charge_id: {telegram_charge_id}\n"
         f"amount (raw): {human_amount}\n"
         f"currency: {currency}\n"
     )
-    print("[PAYMENT] " + log_text)  # stdout для отладки
+    logger.info("[PAYMENT_LOG] " + log_text)
     for admin_chat in ADMIN_CHAT_IDS:
         thread_id = get_log_thread_for_chat(admin_chat)
         try:
@@ -1432,45 +1486,45 @@ async def handle_successful_payment(message: Message):
             else:
                 await bot.send_message(chat_id=admin_chat, text=log_text)
         except Exception as e:
-            print(f"[WARN] Не удалось отправить лог об оплате в {admin_chat} (thread {thread_id}): {e}")
+            logger.warning(f"Не удалось отправить лог об оплате в {admin_chat} (thread {thread_id}): {e}")
 
-    # Автовозврат: вызываем refundStarPayment по telegram_payment_charge_id и user_id (требуется оба параметра)
+    # Автовозврат: выполняем refundStarPayment по telegram_payment_charge_id и user_id
     if telegram_charge_id:
         try:
-            # IMPORTANT: Telegram requires both user_id and telegram_payment_charge_id
-            res = await bot.request("refundStarPayment", {"user_id": user_id_for_record, "telegram_payment_charge_id": telegram_charge_id})
-            # обновим запись
-            tx_update = get_transaction_by_charge_id(telegram_charge_id) or {}
-            tx_update["status"] = "refunded_auto"
-            tx_update["refunded_at"] = _now().isoformat()
-            tx_update["refund_result"] = res
-            record_transaction(tx_update)
-
-            # уведомление пользователя
-            try:
-                await bot.send_message(chat_id=user_id_for_record, text="⚠️ При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
-            except Exception as e:
-                print(f"[WARN] Не удалось уведомить пользователя о возврате: {e}")
-
-            # лог возврата в теме
-            log_refund = (
-                f"Автовозврат выполнен:\nUser ID: {user_id_for_record}\ntelegram_payment_charge_id: {telegram_charge_id}\namount (raw): {human_amount}\n"
-            )
-            for admin_chat in ADMIN_CHAT_IDS:
-                thread_id = get_log_thread_for_chat(admin_chat)
+            await bot.send_message(chat_id=user_id, text="✅ Ваша заявка одобрена! Генерирую оплату....")
+        except Exception:
+            pass
+        try:
+            # Выполняем возврат и логируем ответ
+            res = await refund_star_payment(user_id=user_id, telegram_payment_charge_id=telegram_charge_id)
+            if res.get("ok"):
+                await mark_transaction_refunded(telegram_charge_id)
                 try:
-                    if thread_id is not None:
-                        await bot.send_message(chat_id=admin_chat, text=log_refund, message_thread_id=thread_id)
-                    else:
-                        await bot.send_message(chat_id=admin_chat, text=log_refund)
-                except Exception as e:
-                    print(f"[WARN] Не удалось отправить лог автовореза в {admin_chat} (thread {thread_id}): {e}")
-
+                    await bot.send_message(chat_id=user_id, text="⚠️ При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
+                except Exception:
+                    pass
+                # лог возврата в теме
+                log_refund = (
+                    f"Автовозврат выполнен:\nUser ID: {user_id}\ntelegram_payment_charge_id: {telegram_charge_id}\namount (raw): {human_amount}\n"
+                )
+                for admin_chat in ADMIN_CHAT_IDS:
+                    thread_id = get_log_thread_for_chat(admin_chat)
+                    try:
+                        if thread_id is not None:
+                            await bot.send_message(chat_id=admin_chat, text=log_refund, message_thread_id=thread_id)
+                        else:
+                            await bot.send_message(chat_id=admin_chat, text=log_refund)
+                    except Exception as e:
+                        logger.warning(f"Не удалось отправить лог автовореза в {admin_chat} (thread {thread_id}): {e}")
+            else:
+                logger.error(f"refundStarPayment returned not ok: {res}")
+                # записываем ошибку в транзакцию
+                tx = await get_transaction_by_charge(telegram_charge_id)
+                if tx is not None:
+                    tx["refund_error"] = res
+                    await asyncio.to_thread(_write_all_transactions_sync, _read_all_transactions_sync())  # просто чтоб перезаписать (сохранение изменений)
         except Exception as e:
-            print(f"[ERROR] Ошибка при автоворезе refundStarPayment: {e}")
-            tx_update = get_transaction_by_charge_id(telegram_charge_id) or {}
-            tx_update["refund_error"] = str(e)
-            record_transaction(tx_update)
+            logger.error(f"Ошибка при автоворезе refundStarPayment: {e}")
 
 
 # ------------------ CALLBACK: выдать доступ к оплате (создание invoice для XTR) ------------------
@@ -1479,7 +1533,6 @@ async def grant_payment_access(callback: CallbackQuery):
     """
     Админ нажал 'выдать доступ к оплате' — отправляем пользователю invoice (Stars, currency=XTR).
     payload = "uid::<user_id>" чтобы связать оплату с пользователем при успешной оплате.
-    Транзакция окончательно сохранится после successful_payment (ключ — telegram_payment_charge_id).
     """
     update_user_lang(str(callback.from_user.id), callback.from_user.language_code or "unknown")
 
@@ -1506,30 +1559,27 @@ async def grant_payment_access(callback: CallbackQuery):
     try:
         await bot.send_message(chat_id=uid, text="✅ Ваша заявка одобрена! Генерирую оплату....")
     except Exception as e:
-        print(f"[WARN] Не удалось уведомить пользователя {uid} об одобрении: {e}")
+        logger.warning(f"Не удалось уведомить пользователя {uid} об одобрении: {e}")
 
-    # формируем LabeledPrice — amount в минимальных единицах
-    amount_for_invoice = stars_price  # <-- при необходимости умножь на 100: stars_price * 100
+    # формируем LabeledPrice — amount в минимальных единицах (в примере используется amount прямо)
+    amount_for_invoice = stars_price  # если потребуется, умножь на 100
     price = [LabeledPrice(label="Доступ к Gene Premium ULTIMATE (1 мес)", amount=amount_for_invoice)]
 
     try:
-        # отправляем инвойс с provider_token пустым (для XTR) и currency XTR
-        # payload содержит наш user id, чтобы связать оплату при successful_payment
         invoice_msg = await bot.send_invoice(
             chat_id=uid,
             title="Доступ к Gene Premium ULTIMATE",
             description="На 1 месяц.",
             payload=f"uid::{uid}",
-            provider_token="",
+            provider_token="",  # empty for Stars (XTR)
             currency="XTR",
             prices=price,
         )
-        # Отправка invoice успешно — можно опционально логировать факт отправки invoice в admin chat
+        # Отправка invoice успешно — логируем факт отправки invoice в admin chat (лог-тема)
         for admin_chat in ADMIN_CHAT_IDS:
             try:
-                thread_id = get_thread_for_chat(admin_chat)
-                text = f"Инвойс отправлен пользователю {uid} на {stars_price} ⭐️."
                 log_thread = get_log_thread_for_chat(admin_chat)
+                text = f"Инвойс отправлен пользователю {uid} на {stars_price} ⭐️."
                 if log_thread is not None:
                     await bot.send_message(chat_id=admin_chat, text=text, message_thread_id=log_thread)
                 else:
@@ -1537,7 +1587,7 @@ async def grant_payment_access(callback: CallbackQuery):
             except Exception:
                 pass
     except Exception as e:
-        print(f"[ERROR] Не удалось отправить инвойс пользователю {uid}: {e}")
+        logger.error(f"Не удалось отправить инвойс пользователю {uid}: {e}")
         try:
             await callback.message.answer(f"Ошибка при отправке инвойса пользователю {uid}: {e}")
         except Exception:
@@ -1555,7 +1605,6 @@ async def grant_payment_access(callback: CallbackQuery):
 async def cmd_refund(message: Message):
     """
     /refund <telegram_payment_charge_id>  -> вернуть звёзды по id операции, который дал Telegram
-    Можно также: /refund <telegram_payment_charge_id> <user_id> (если транзакция не найдена в локальном файле)
     Доступно только для админов.
     """
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
@@ -1566,67 +1615,59 @@ async def cmd_refund(message: Message):
 
     parts = message.text.split(maxsplit=2)
     if len(parts) < 2 or not parts[1].strip():
-        await message.reply("Использование: /refund <telegram_payment_charge_id> [user_id]")
+        await message.reply("Использование: /refund <telegram_payment_charge_id>")
         return
 
     charge_id = parts[1].strip()
-    provided_user_id = None
-    if len(parts) >= 3 and parts[2].strip():
-        try:
-            provided_user_id = int(parts[2].strip())
-        except Exception:
-            provided_user_id = None
 
-    tx = get_transaction_by_charge_id(charge_id)
-    if not tx and provided_user_id is None:
-        await message.reply("Транзакция не найдена в локальной базе. Повторите команду как: /refund <charge_id> <user_id>")
+    tx = await get_transaction_by_charge(charge_id)
+    if not tx:
+        await message.reply("Транзакция не найдена в local transactions.json")
         return
 
-    # определяем user_id для возврата
-    user_id_for_refund = provided_user_id or (tx.get("user_id") if tx else None)
+    if tx.get("refunded"):
+        await message.reply("Транзакция уже помечена как возвращённая.")
+        return
+
+    user_id_for_refund = tx.get("user_id")
     if not user_id_for_refund:
-        await message.reply("Не удалось определить user_id для возврата. Укажите его вторым аргументом: /refund <charge_id> <user_id>")
+        await message.reply("Не удалось определить user_id для возврата.")
         return
 
-    # Если уже возвращена
-    if tx and tx.get("status", "").startswith("refunded"):
-        await message.reply(f"Транзакция уже возвращена. Статус: {tx.get('status')}")
-        return
-
-    # Выполняем refundStarPayment
+    await message.reply(f"Инициализация возврата для charge_id={charge_id} user_id={user_id_for_refund}...")
     try:
-        res = await bot.request("refundStarPayment", {"user_id": int(user_id_for_refund), "telegram_payment_charge_id": charge_id})
-        tx2 = tx or {"telegram_payment_charge_id": charge_id, "user_id": user_id_for_refund, "amount": None, "currency": None}
-        tx2["status"] = "refunded_manual"
-        tx2["refunded_at"] = _now().isoformat()
-        tx2["refund_result_manual"] = res
-        record_transaction(tx2)
-        # уведомляем пользователя
-        try:
-            await bot.send_message(chat_id=user_id_for_refund, text=f"⭐️ Ваш платёж (id {charge_id}) возвращён администратором.")
-        except Exception as e:
-            print(f"[WARN] Не удалось уведомить пользователя о возврате: {e}")
-
-        await message.reply(f"✅ Возврат выполнен для {charge_id}.")
-        # логируем в лог-теме
-        log_text = f"Ручной возврат: telegram_charge {charge_id}, user {user_id_for_refund}, выполнен админом: {message.from_user.id}"
-        for admin_chat in ADMIN_CHAT_IDS:
-            thread_id = get_log_thread_for_chat(admin_chat)
+        result = await refund_star_payment(int(user_id_for_refund), charge_id)
+        if result.get("ok"):
+            await mark_transaction_refunded(charge_id)
+            await message.reply("✅ Возврат выполнен успешно.")
+            # уведомляем пользователя
             try:
-                if thread_id is not None:
-                    await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
-                else:
-                    await bot.send_message(chat_id=admin_chat, text=log_text)
-            except Exception as e:
-                print(f"[WARN] Не удалось сохранить лог возврата в {admin_chat} (thread {thread_id}): {e}")
+                await bot.send_message(chat_id=user_id_for_refund, text=f"⭐️ Ваш платёж (id {charge_id}) возвращён администратором.")
+            except Exception:
+                pass
+            # лог в лог-теме
+            log_text = f"Ручной возврат: telegram_charge {charge_id}, user {user_id_for_refund}, выполнен админом: {message.from_user.id}"
+            for admin_chat in ADMIN_CHAT_IDS:
+                thread_id = get_log_thread_for_chat(admin_chat)
+                try:
+                    if thread_id is not None:
+                        await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
+                    else:
+                        await bot.send_message(chat_id=admin_chat, text=log_text)
+                except Exception as e:
+                    logger.warning(f"Не удалось сохранить лог возврата в {admin_chat} (thread {thread_id}): {e}")
+        else:
+            await message.reply(f"Ошибка при возврате: {result}")
     except Exception as e:
         await message.reply(f"Ошибка при попытке вернуть: {e}")
-        print(f"[ERROR] Ошибка refundStarPayment (manual): {e}")
+        logger.error(f"[REFUND ERROR] {e}")
 
 
 # ===================== MAIN =====================
 async def main():
-    print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+    logger.info(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
+    # init transactions db
+    await init_transactions()
     # Попытка заранее создать темы, которые указаны в ADMIN_THREAD_NAMES и ещё не сохранены
     for admin_chat in ADMIN_CHAT_IDS:
         try:
@@ -1635,6 +1676,12 @@ async def main():
             pass
     await dp.start_polling(bot)
 
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
 
 if __name__ == "__main__":
     asyncio.run(main())
