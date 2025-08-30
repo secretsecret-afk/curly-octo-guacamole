@@ -100,9 +100,8 @@ ADMIN_MAP_FILE = "admin_map.json"  # сохраняет маппинг "chat:msg
 ADMIN_TOPICS_FILE = "admin_topics.json"  # сохраняет маппинг chat_id -> thread_id (созданные темы)
 REJECTED_FILE = "rejected.json"  # сохраняет пользователей, которым отклонили заявку
 
-# NEW: payments and users file
+# NEW: payments file
 PAYMENTS_FILE = "payments.json"
-USERS_FILE = "users.json"
 
 # Buffers and tasks to collect messages sent by user within a short window
 submission_buffers: Dict[str, List[Message]] = defaultdict(list)
@@ -300,33 +299,6 @@ try:
 except Exception:
     rejected_users = set()
 
-# ===================== USERS list helpers =====================
-def load_users() -> List[int]:
-    if not os.path.exists(USERS_FILE):
-        return []
-    try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-            return [int(x) for x in raw if x is not None]
-    except Exception:
-        return []
-
-
-def save_users(lst: List[int]) -> None:
-    try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(set(lst)), f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"[WARN] Не удалось сохранить {USERS_FILE}: {e}")
-
-
-def add_user(uid: int) -> None:
-    users = load_users()
-    if uid not in users:
-        users.append(uid)
-        save_users(users)
-
-
 # ===================== REQUESTS / LANGS =====================
 
 
@@ -415,6 +387,21 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+# ===================== HELPERS =====================
+
+
+async def ensure_private_and_autoleave(message: Message) -> bool:
+    if message.chat.type != "private":
+        if message.chat.id not in ADMIN_CHAT_IDS:
+            try:
+                await bot.leave_chat(message.chat.id)
+                print(f"[LOG] Вышел из чата {message.chat.id}")
+            except Exception as e:
+                print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
+        return False
+    return True
 
 
 # ===================== PAYMENTS DB HELPERS =====================
@@ -526,19 +513,26 @@ async def refund_star_payment(user_id: int, telegram_payment_charge_id: str) -> 
         return {"ok": False, "error": "exception", "text": str(e)}
 
 
-# ===================== HELPERS =====================
+# ===================== EDIT ORIGINAL HELPERS =====================
 
-
-async def ensure_private_and_autoleave(message: Message) -> bool:
-    if message.chat.type != "private":
-        if message.chat.id not in ADMIN_CHAT_IDS:
-            try:
-                await bot.leave_chat(message.chat.id)
-                print(f"[LOG] Вышел из чата {message.chat.id}")
-            except Exception as e:
-                print(f"[ERROR] Не удалось выйти из чата {message.chat.id}: {e}")
-        return False
-    return True
+async def _try_edit_original_message(chat_id: int, message_id: int, text: str, reply_markup, prefer_caption: bool) -> bool:
+    if prefer_caption:
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+            return True
+        except Exception:
+            pass
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+    try:
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+    return False
 
 
 # ===================== HELP: thread selection & creation =====================
@@ -662,10 +656,9 @@ async def forward_no_request_to_admins(message: Message):
     """Если пользователь пишет боту без активной заявки — пересылаем/копируем сообщение в админ-чаты и отправляем лог."""
     user = message.from_user
     uid = user.id
-    add_user(uid)  # сохраняем в список пользователей для рассылок
     safe_full_name = escape(user.full_name or "(без имени)")
     safe_username = f"@{escape(user.username)}" if getattr(user, "username", None) else ""
-    header = f"Сообщение без заявки от {safe_full_name} {safe_username}\nID: {uid}\n\n"
+    header = f"Сообщение от {safe_full_name} {safe_username}\nID: {uid}\n\n"
     preview = ""
     try:
         # попытаемся получить текст / caption
@@ -674,7 +667,7 @@ async def forward_no_request_to_admins(message: Message):
             preview = escape(txt if len(txt) < 1500 else txt[:1500] + "...")
     except Exception:
         preview = "(не удалось получить текст)"
-    # Основная пересылка: копируем сообщение (чтобы админ мог нажать reply на медиa)
+    # Основная пересылка: копируем сообщение (для медиа/файлов) или пересылаем text
     for admin_chat in ADMIN_CHAT_IDS:
         thread_id = await ensure_or_create_topic_for_chat(admin_chat)
         try:
@@ -683,8 +676,9 @@ async def forward_no_request_to_admins(message: Message):
                 copied = await bot.copy_message(chat_id=admin_chat, from_chat_id=message.chat.id, message_id=message.message_id, message_thread_id=thread_id)
                 set_admin_map(admin_chat, copied.message_id, uid)
             except Exception:
+                # fallback: отправляем текст превью
                 copied = None
-            # отправим текстовый лог о сообщении (убрали слово 'Капшн')
+            # отправим текстовый лог о сообщении
             log_text = header + (f"Текст:\n{preview}" if preview else "(нет текста)")
             sent = await bot.send_message(chat_id=admin_chat, text=log_text, message_thread_id=thread_id)
             set_admin_map(admin_chat, sent.message_id, uid)
@@ -870,6 +864,7 @@ async def ask_screenshots(callback: CallbackQuery):
         return
     user, user_id_str = callback.from_user, str(callback.from_user.id)
     if not can_start_new_request(user_id_str):
+        # логируем и пересылаем сообщение в админ-чаты (пользователь уже подавал заявку)
         await callback.message.answer("Вы уже подавали заявку, ожидайте одобрения ✅")
         return
     langs = update_user_lang(user_id_str, user.language_code or "unknown")
@@ -1248,8 +1243,6 @@ async def handle_submission(messages: Union[Message, List[Message]]):
     user = first_message.from_user
     user_id_str = str(user.id)
 
-    add_user(user.id)
-
     if is_banned(user.id):
         remove_request(user_id_str)
         submission_buffers.pop(user_id_str, None)
@@ -1370,8 +1363,8 @@ async def handle_submission(messages: Union[Message, List[Message]]):
 async def collect_user_messages(message: Message):
     update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
 
-    # добавляем пользователя в базу пользователей (для broadcast)
-    add_user(message.from_user.id)
+    # можно логировать отправку сообщений пользователем (необязательно)
+    # await log_user_action(message, "Отправил сообщение в личку")
 
     if is_banned(message.from_user.id):
         remove_request(str(message.from_user.id))
@@ -1550,18 +1543,18 @@ async def issue_payment_callback(callback: CallbackQuery):
         await callback.message.answer("Цена в stars не задана. Используйте /setprice_stars <число>.", reply=False)
         return
 
-    # уведомляем пользователя об одобрении (как просил)
-    try:
-        await bot.send_message(chat_id=target_user_id, text="Ваша заявка одобрена! Генерирую оплату....")
-    except Exception:
-        pass
-
-    title = "Доступ к Gene Premium ULTIMATE На 1 месяц."
-    description = f"Доступ к Gene Premium ULTIMATE — {price_stars} Stars"
+    title = "Доступ к Gene Premium ULTIMATE На 1 месяц"
+    description = f"Доступ к Gene Premium ULTIMATE — 1 месяц."
     payload = f"auto_refund:admin_issue_{callback.from_user.id}_to_{target_user_id}_{int(time.time())}"
 
     prices = [LabeledPrice(label=title, amount=price_stars)]
     try:
+        # Сначала уведомим пользователя
+        try:
+            await bot.send_message(chat_id=target_user_id, text="Ваша заявка одобрена! Генерирую оплату....")
+        except Exception as e:
+            print(f"[WARN] Не удалось уведомить пользователя перед отправкой счёта: {e}")
+
         # provider_token может быть пустым, но чаще нужен
         await bot.send_invoice(
             chat_id=target_user_id,
@@ -1572,7 +1565,7 @@ async def issue_payment_callback(callback: CallbackQuery):
             currency="XTR",
             prices=prices,
         )
-        await callback.message.answer(f"Счёт на {price_stars} Stars отправлен пользователю {target_user_id}.", reply=False)
+        await callback.message.answer(f"Счёт отправлен пользователю {target_user_id}.", reply=False)
     except Exception as e:
         await callback.message.answer(f"Ошибка при отправке счёта: {e}", reply=False)
 
@@ -1612,11 +1605,10 @@ async def successful_payment_handler(message: Message):
     except Exception:
         stext = "(ошибка при чтении текста заявки)"
 
-    # лог: показываем сумму и charge_id
     log_text = (
         f"Платёж: user={message.from_user.full_name} @{getattr(message.from_user,'username', '')} id={user_id}\n"
         f"amount={total_amount} {currency}\ncharge_id={charge_id}\npayload={payload}\n\n"
-        f"Текст заявки:\n{stext if stext else '(нет текста)'}"
+        f"Текст заявки:\n{stext}"
     )
     for admin_chat in ADMIN_CHAT_IDS:
         try:
@@ -1624,29 +1616,38 @@ async def successful_payment_handler(message: Message):
         except Exception:
             pass
 
-    # Если payload содержит auto_refund — выполняем автоматический возврат и информируем
-    if "auto_refund" in payload:
+    # Если payload содержит auto_refund или admin_issue — выполняем автоматический возврат и информируем
+    if ("auto_refund" in payload) or ("admin_issue" in payload):
         try:
-            await message.reply("При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
-        except Exception:
-            pass
-        result = await refund_star_payment(user_id, charge_id)
-        if result.get("ok"):
-            await mark_refunded(charge_id)
+            # Сообщаем пользователю, что произошла ошибка и будет возврат
             try:
-                await message.reply("Возврат выполнен успешно.")
+                await message.reply("При генерации ссылки на чат произошла ошибка. Возвращаю звезды...")
             except Exception:
                 pass
-            # лог в админ-чаты
-            for admin_chat in ADMIN_CHAT_IDS:
+
+            result = await refund_star_payment(user_id, charge_id)
+            if result.get("ok"):
+                await mark_refunded(charge_id)
                 try:
-                    await bot.send_message(admin_chat, f"Авто-возврат выполнен для charge_id={charge_id} user={user_id}")
+                    await message.reply("При генерации ссылки на чат произошла ошибка. Звезды возвращены.")
                 except Exception:
                     pass
-        else:
+                # лог в админ-чаты
+                for admin_chat in ADMIN_CHAT_IDS:
+                    try:
+                        await bot.send_message(admin_chat, f"Авто-возврат выполнен для charge_id={charge_id} user={user_id} amount={total_amount} {currency}")
+                    except Exception:
+                        pass
+            else:
+                for admin_chat in ADMIN_CHAT_IDS:
+                    try:
+                        await bot.send_message(admin_chat, f"Не удалось выполнить авто-возврат для charge_id={charge_id}: {result}")
+                    except Exception:
+                        pass
+        except Exception as e:
             for admin_chat in ADMIN_CHAT_IDS:
                 try:
-                    await bot.send_message(admin_chat, f"Не удалось выполнить авто-возврат для charge_id={charge_id}: {result}")
+                    await bot.send_message(admin_chat, f"Ошибка при попытке авто-возврата charge_id={charge_id}: {e}")
                 except Exception:
                     pass
 
@@ -1691,17 +1692,17 @@ async def cmd_issuepay(message: Message):
         await message.reply("Цена в stars не задана. Используйте /setprice_stars <число>.")
         return
 
-    # notify user of approval
-    try:
-        await bot.send_message(chat_id=target_id, text="Ваша заявка одобрена! Генерирую оплату....")
-    except Exception:
-        pass
-
-    title = "Доступ к Gene Premium ULTIMATE На 1 месяц."
-    description = f"Доступ к Gene Premium ULTIMATE — {price_stars} Stars"
+    title = "Доступ к Gene Premium ULTIMATE На 1 месяц"
+    description = f"Доступ к Gene Premium ULTIMATE — 1 месяц."
     payload = f"admin_issue_manual_{message.from_user.id}_to_{target_id}_{int(time.time())}"
     prices = [LabeledPrice(label=title, amount=price_stars)]
     try:
+        try:
+        # уведомим пользователя
+        try:
+            await bot.send_message(chat_id=target_id, text="Ваша заявка одобрена! Генерирую оплату....")
+        except Exception:
+            pass
         await bot.send_invoice(
             chat_id=target_id,
             title=title,
@@ -1711,7 +1712,7 @@ async def cmd_issuepay(message: Message):
             currency="XTR",
             prices=prices,
         )
-        await message.reply(f"Счёт на {price_stars} Stars отправлен пользователю {target_id}.")
+        await message.reply(f"Счёт отправлен пользователю {target_id}.")
     except Exception as e:
         await message.reply(f"Ошибка при отправке счёта: {e}")
 
@@ -1779,133 +1780,6 @@ async def cmd_reject(message: Message):
     await message.reply(f"Заявка пользователя {target_id} помечена как отклонённая.")
 
 
-# -------------------- COMMAND: /refund (ручной возврат по charge_id) --------------------
-@dp.message(Command("refund"))
-async def cmd_refund(message: Message):
-    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    await log_user_action(message, f"Команда /refund ({message.text})")
-    if message.from_user.id not in MAIN_ADMIN_IDS:
-        await message.reply("У вас нет прав на эту команду.")
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.reply("Использование: /refund <telegram_payment_charge_id>")
-        return
-    charge_id = parts[1].strip()
-    rec = await get_payment_by_charge(charge_id)
-    if not rec:
-        await message.reply("Транзакция не найдена в payments.json")
-        return
-    if rec.get("refunded"):
-        await message.reply("Транзакция уже помечена как возвращённая.")
-        return
-    user_id = rec.get("user_id")
-    await message.reply(f"Инициализация возврата для charge_id={charge_id} user_id={user_id}...")
-    result = await refund_star_payment(user_id, charge_id)
-    if result.get("ok"):
-        await mark_refunded(charge_id)
-        await message.reply("Возврат выполнен успешно.")
-        # лог в админ-чаты
-        for admin_chat in ADMIN_CHAT_IDS:
-            try:
-                await bot.send_message(admin_chat, f"Ручной возврат выполнен для charge_id={charge_id} user={user_id}")
-            except Exception:
-                pass
-    else:
-        await message.reply(f"Ошибка при возврате: {result}")
-
-
-# ------------------ Admin commands: broadcast, reject_all, issuepay_all ------------------
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: Message):
-    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    await log_user_action(message, f"Команда /broadcast ({message.text})")
-
-    if message.from_user.id not in MAIN_ADMIN_IDS:
-        await message.reply("У вас нет прав.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply("Использование: /broadcast <текст>")
-        return
-    text = parts[1].strip()
-    users = load_users()
-    sent = 0
-    failed = 0
-    for uid in users:
-        try:
-            await bot.send_message(chat_id=uid, text=text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-    await message.reply(f"Рассылка завершена. Отправлено: {sent}. Ошибки: {failed}.")
-
-
-@dp.message(Command("reject_all"))
-async def cmd_reject_all(message: Message):
-    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    await log_user_action(message, f"Команда /reject_all ({message.text})")
-
-    if message.from_user.id not in ALL_ADMINS_SET:
-        await message.reply("У вас нет прав.")
-        return
-
-    data = load_requests()
-    count = 0
-    for uid, rec in list(data.items()):
-        if rec.get("submitted"):
-            rec["rejected"] = True
-            rec["submitted"] = False
-            rec["started_at"] = None
-            rec["has_seen_instructions"] = False
-            data[uid] = rec
-            try:
-                add_rejected(int(uid))
-            except Exception:
-                pass
-            count += 1
-    save_requests(data)
-    await message.reply(f"Отклонены все активные заявки: {count} шт.")
-
-
-@dp.message(Command("issuepay_all"))
-async def cmd_issuepay_all(message: Message):
-    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
-    await log_user_action(message, f"Команда /issuepay_all ({message.text})")
-
-    if message.from_user.id not in ALL_ADMINS_SET and message.from_user.id not in MAIN_ADMIN_IDS:
-        await message.reply("У вас нет прав.")
-        return
-
-    cfg = load_config()
-    price_stars = int(cfg.get("price_stars", 0))
-    data = load_requests()
-    count_sent = 0
-    count_failed = 0
-    for uid, rec in list(data.items()):
-        if rec.get("submitted"):
-            try:
-                try:
-                    await bot.send_message(chat_id=int(uid), text="Ваша заявка одобрена! Генерирую оплату....")
-                except Exception:
-                    pass
-                title = "Доступ к Gene Premium ULTIMATE На 1 месяц."
-                description = f"Доступ к Gene Premium ULTIMATE — {price_stars} Stars"
-                payload = f"auto_refund:batch_issue_by_{message.from_user.id}_to_{uid}_{int(time.time())}"
-                prices = [LabeledPrice(label=title, amount=price_stars)]
-                await bot.send_invoice(chat_id=int(uid), title=title, description=description, payload=payload, provider_token=PROVIDER_TOKEN_STARS, currency="XTR", prices=prices)
-                rec["submitted"] = False
-                rec["started_at"] = None
-                data[uid] = rec
-                count_sent += 1
-                await asyncio.sleep(0.06)
-            except Exception:
-                count_failed += 1
-    save_requests(data)
-    await message.reply(f"Счета отправлены: {count_sent}. Ошибки: {count_failed}.")
-
-
 # ===================== MAIN =====================
 async def main():
     print(f"[BOOT] ADMIN_CHAT_IDS={ADMIN_CHAT_IDS}, ADMIN_THREAD_IDS={ADMIN_THREAD_IDS}, ADMIN_THREAD_NAMES={ADMIN_THREAD_NAMES}, ADMIN_LOG_THREAD_IDS={ADMIN_LOG_THREAD_IDS}, MAIN_ADMIN_IDS={MAIN_ADMIN_IDS}, ADMINS={ADMINS}")
@@ -1925,3 +1799,128 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# ===================== NEW: /broadcast command (отправка всем пользователям) =====================
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    """
+    /broadcast <text>
+    Отправляет текст всем известным пользователям (из requests.json и payments.json)
+    """
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, f"Команда /broadcast ({message.text})")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply("Использование: /broadcast <текст>")
+        return
+    text_to_send = parts[1].strip()
+
+    # собираем user ids
+    uids = set()
+    try:
+        reqs = load_requests()
+        for k in reqs.keys():
+            try:
+                uids.add(int(k))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        payments = _read_payments_sync()
+        for p in payments:
+            try:
+                uids.add(int(p.get("user_id")))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    sent = 0
+    failed = 0
+    for uid in list(uids):
+        try:
+            await bot.send_message(chat_id=uid, text=text_to_send)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+            continue
+
+    await message.reply(f"Готово. Отправлено: {sent}, не доставлено: {failed}.")
+
+# ===================== NEW: /reject_all и /issuepay_all =====================
+@dp.message(Command("reject_all"))
+async def cmd_reject_all(message: Message):
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, "Команда /reject_all")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    data = load_requests()
+    count = 0
+    for k in list(data.keys()):
+        rec = data.get(k, {})
+        rec["rejected"] = True
+        rec["submitted"] = False
+        rec["started_at"] = None
+        rec["has_seen_instructions"] = False
+        data[k] = rec
+        try:
+            add_rejected(int(k))
+        except Exception:
+            pass
+        count += 1
+    save_requests(data)
+    await message.reply(f"Отклонены все заявки: {count} пользователей.")
+
+
+@dp.message(Command("issuepay_all"))
+async def cmd_issuepay_all(message: Message):
+    """Отправляет счёт всем пользователям, у кого висит заявка (submitted True). Закрывает заявку после отправки (submitted->False)."""
+    update_user_lang(str(message.from_user.id), message.from_user.language_code or "unknown")
+    await log_user_action(message, "Команда /issuepay_all")
+
+    if message.from_user.id not in ALL_ADMINS_SET:
+        return
+
+    data = load_requests()
+    cfg = load_config()
+    price_stars = int(cfg.get("price_stars", 0)) if isinstance(cfg.get("price_stars", None), int) else int(cfg.get("price_stars", 0) if cfg.get("price_stars", 0) else 0)
+    if price_stars <= 0:
+        await message.reply("Цена в stars не задана. Используйте /setprice_stars <число>.")
+        return
+
+    sent = 0
+    errors = 0
+    for k, rec in list(data.items()):
+        try:
+            uid = int(k)
+        except Exception:
+            continue
+        if rec.get("submitted") and not rec.get("rejected"):
+            try:
+                title = "Доступ к Gene Premium ULTIMATE На 1 месяц"
+                description = f"Доступ к Gene Premium ULTIMATE — 1 месяц."
+                payload = f"auto_refund:bulk_issue_to_{uid}_{int(time.time())}"
+                prices = [LabeledPrice(label=title, amount=price_stars)]
+                try:
+                    await bot.send_message(chat_id=uid, text="Ваша заявка одобрена! Генерирую оплату....")
+                except Exception:
+                    pass
+                await bot.send_invoice(chat_id=uid, title=title, description=description, payload=payload, provider_token=PROVIDER_TOKEN_STARS, currency="XTR", prices=prices)
+                # Закрываем заявку (как просили: отправлять оплату и закрывать заявку)
+                rec["submitted"] = False
+                save_requests(data)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                print(f"[WARN] issuepay_all for {uid} error: {e}")
+                errors += 1
+                continue
+    await message.reply(f"Счета отправлены: {sent}, ошибки: {errors}.")
